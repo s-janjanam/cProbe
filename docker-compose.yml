@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  nprobe:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: nprobe-collector
+    restart: unless-stopped
+    
+    # Network configuration
+    network_mode: host
+    
+    # Privileged mode for PF_RING kernel module access
+    privileged: true
+    
+    # Capabilities
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_ADMIN
+      - IPC_LOCK
+    
+    # Volume mounts
+    volumes:
+      - ./config:/etc/nprobe:ro
+      - ./logs:/var/log/nprobe
+      - /dev:/dev
+      - /proc:/proc
+      - /sys:/sys
+      - /lib/modules:/lib/modules:ro
+      - hugepages:/mnt/huge
+    
+    # Environment variables
+    environment:
+      - DEBIAN_FRONTEND=noninteractive
+      - PFRING_ZC_LICENSE=${PFRING_ZC_LICENSE:-}
+      - NPROBE_LICENSE=${NPROBE_LICENSE:-}
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    
+    # Hugepages configuration
+    shm_size: 2g
+    
+    # Security options (adjust as needed)
+    security_opt:
+      - seccomp:unconfined
+    
+    # Health check
+    healthcheck:
+      test: ["/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Ports (if not using host networking)
+    # ports:
+    #   - "2055:2055/udp"  # NetFlow collector port
+    #   - "8080:8080/tcp"  # Web interface
+    #   - "9995:9995/tcp"  # nProbe statistics
+    
+    # Dependencies
+    depends_on:
+      - syslog
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # Optional: Syslog service for centralized logging
+  syslog:
+    image: balabit/syslog-ng:latest
+    container_name: nprobe-syslog
+    restart: unless-stopped
+    volumes:
+      - ./logs:/var/log
+      - ./syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+    ports:
+      - "514:514/udp"
+      - "514:514/tcp"
+
+  # Optional: Prometheus exporter for monitoring
+  prometheus-exporter:
+    image: prom/node-exporter:latest
+    container_name: nprobe-exporter
+    restart: unless-stopped
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+
+volumes:
+  hugepages:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=2g,huge=always
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
