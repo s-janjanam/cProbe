@@ -1,134 +1,94 @@
 {
   "nprobe": {
-    "license_key": "YOUR_NPROBE_LICENSE_KEY_HERE",
-    "interfaces": [
-      {
-        "name": "eth0",
-        "type": "pfring",
-        "pfring_cluster_id": 10,
-        "pfring_application_name": "nprobe"
-      }
-    ],
+    "general": {
+      "verbose_level": 2,
+      "daemon_mode": false,
+      "pid_file": "/var/run/nprobe.pid",
+      "user": "nprobe",
+      "group": "nprobe"
+    },
     "capture": {
-      "snaplen": 128,
-      "promisc_mode": true,
-      "pfring_zc_mode": true,
-      "pfring_zc_device": "zc:eth0"
+      "interface": "enp104s0f0np0",
+      "capture_direction": "both",
+      "promisc_mode": false,
+      "kernel_bypass": true,
+      "pfring_zc": true,
+      "cluster_id": 10,
+      "num_threads": 4
     },
-    "flow_collection": {
+    "flow_export": {
+      "netflow_version": 9,
+      "collector_ip": "192.168.1.100",
+      "collector_port": 2055,
+      "source_ip": "0.0.0.0",
+      "source_port": 0,
+      "template_refresh_rate": 300,
+      "max_flows_per_packet": 30,
+      "flow_export_delay": 1,
       "active_timeout": 300,
-      "inactive_timeout": 30,
-      "max_flows": 2000000,
-      "flow_hash_size": 32768
+      "inactive_timeout": 15
     },
-    "netflow": {
-      "version": 9,
-      "template_id": 256,
-      "template_refresh_rate": 1000,
-      "export_format": "netflow"
-    },
-    "collectors": [
-      {
-        "name": "primary_collector",
-        "enabled": true,
-        "host": "collector.example.com",
-        "port": 2055,
-        "protocol": "udp",
-        "template": "standard"
-      },
-      {
-        "name": "backup_collector",
-        "enabled": false,
-        "host": "backup-collector.example.com",
-        "port": 2055,
-        "protocol": "udp",
-        "template": "standard"
-      }
-    ],
-    "local_networks": [
-      "192.168.0.0/16",
-      "10.0.0.0/8",
-      "172.16.0.0/12"
-    ],
-    "logging": {
-      "level": "info",
-      "file": "/var/log/nprobe/nprobe.log",
-      "max_file_size": "100MB",
-      "max_files": 5,
-      "syslog": false
-    },
-    "performance": {
-      "num_threads": 4,
-      "cpu_affinity": true,
-      "packet_buffer_size": 2048,
-      "flow_buffer_size": 1024
-    },
-    "features": {
-      "geoip": true,
-      "geoip_db_path": "/opt/GeoIP/GeoLite2-City.mmdb",
-      "asn_lookup": true,
-      "dns_resolution": false,
-      "http_stats": true,
-      "ssl_stats": true,
-      "collect_port_stats": true
-    },
-    "filtering": {
-      "bpf_filter": "",
-      "ignore_vlans": [],
-      "ignore_protocols": [],
-      "sample_rate": 1
+    "flow_processing": {
+      "hash_size": 32768,
+      "max_num_flows": 200000,
+      "flow_export_policy": "immediate",
+      "accounting_mode": "packet",
+      "packet_sampling_rate": 1
     },
     "templates": {
-      "standard": {
-        "fields": [
-          "IN_BYTES", "IN_PKTS", "FLOWS", "PROTOCOL", "SRC_TOS",
-          "TCP_FLAGS", "L4_SRC_PORT", "IPV4_SRC_ADDR", "SRC_MASK",
-          "INPUT_SNMP", "L4_DST_PORT", "IPV4_DST_ADDR", "DST_MASK",
-          "OUTPUT_SNMP", "IPV4_NEXT_HOP", "SRC_AS", "DST_AS",
-          "BGP_IPV4_NEXT_HOP", "MUL_DST_PKTS", "MUL_DST_BYTES",
-          "LAST_SWITCHED", "FIRST_SWITCHED", "OUT_BYTES", "OUT_PKTS",
-          "MIN_PKT_LNGTH", "MAX_PKT_LNGTH", "ICMP_TYPE",
-          "MUL_IGMP_TYPE", "SAMPLING_INTERVAL", "SAMPLING_ALGORITHM",
-          "FLOW_ACTIVE_TIMEOUT", "FLOW_INACTIVE_TIMEOUT"
-        ]
-      },
-      "extended": {
-        "fields": [
-          "IN_BYTES", "IN_PKTS", "FLOWS", "PROTOCOL", "SRC_TOS",
-          "TCP_FLAGS", "L4_SRC_PORT", "IPV4_SRC_ADDR", "SRC_MASK",
-          "INPUT_SNMP", "L4_DST_PORT", "IPV4_DST_ADDR", "DST_MASK",
-          "OUTPUT_SNMP", "IPV4_NEXT_HOP", "SRC_AS", "DST_AS",
-          "FIRST_SWITCHED", "LAST_SWITCHED", "OUT_BYTES", "OUT_PKTS",
-          "APPLICATION_ID", "FLOW_ID", "HTTP_URL", "HTTP_METHOD",
-          "HTTP_HOST", "HTTP_USER_AGENT", "SSL_SERVER_NAME"
-        ]
-      }
+      "custom_template": "%IPV4_SRC_ADDR %IPV4_DST_ADDR %L4_SRC_PORT %L4_DST_PORT %PROTOCOL %IN_BYTES %OUT_BYTES %IN_PKTS %OUT_PKTS %FIRST_SWITCHED %LAST_SWITCHED %TCP_FLAGS %TOS %SRC_AS %DST_AS %IPV4_NEXT_HOP %INPUT_SNMP %OUTPUT_SNMP",
+      "use_custom_template": true
     },
-    "web_interface": {
+    "licenses": {
+      "nprobe_license": "",
+      "pfring_license": "",
+      "license_file": "/opt/nprobe/config/license.key"
+    },
+    "logging": {
+      "log_file": "/opt/nprobe/logs/nprobe.log",
+      "log_level": "info",
+      "syslog_enabled": false,
+      "max_log_size": "100MB",
+      "log_rotation": true
+    },
+    "performance": {
+      "cpu_affinity": "",
+      "memory_limit": "512MB",
+      "ring_buffer_size": "2048",
+      "poll_timeout": 500
+    },
+    "security": {
+      "drop_privileges": true,
+      "chroot_dir": "",
+      "bind_to_device": true
+    },
+    "advanced": {
+      "ignore_vlan": false,
+      "ignore_mpls": false,
+      "fragment_handling": true,
+      "tcp_reordering": true,
+      "application_detection": false,
+      "geolocation": false
+    }
+  },
+  "environment": {
+    "mellanox_ofed": {
       "enabled": true,
-      "port": 8080,
-      "bind_address": "0.0.0.0",
-      "username": "admin",
-      "password": "change_me_please"
-    }
-  },
-  "pfring": {
-    "cluster_settings": {
-      "cluster_id": 10,
-      "cluster_mode": "round_robin",
-      "cluster_type": "per_flow_5_tuple"
+      "version": "latest",
+      "configure_hugepages": true,
+      "hugepages_size": "2MB",
+      "hugepages_count": 1024
     },
-    "zc_settings": {
-      "queue_size": 8192,
-      "buffer_size": 2048,
-      "prefetch_size": 256,
-      "hugepages": true
+    "system": {
+      "set_cpu_governor": "performance",
+      "disable_irq_balance": true,
+      "tune_network_stack": true
     }
   },
-  "system": {
-    "max_locked_memory": "unlimited",
-    "hugepages_count": 1024,
-    "cpu_isolation": [],
-    "irq_affinity": true
+  "monitoring": {
+    "statistics_interval": 60,
+    "export_stats": true,
+    "stats_format": "json",
+    "health_check_port": 8080
   }
 }
