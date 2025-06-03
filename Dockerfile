@@ -1,96 +1,65 @@
 FROM ubuntu:22.04
 
-# Set environment variables
+# Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PFRING_VERSION=8.2.0
-ENV NPROBE_VERSION=10.2
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Set working directory
+WORKDIR /opt/nprobe
+
+# Install basic dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    software-properties-common \
     wget \
     curl \
     build-essential \
-    libtool \
-    autotools-dev \
-    automake \
-    pkg-config \
-    libnuma-dev \
-    libpcap-dev \
-    ethtool \
-    net-tools \
-    tcpdump \
-    flex \
-    bison \
-    libssl-dev \
-    python3 \
-    python3-pip \
-    git \
-    vim \
-    dkms \
     linux-headers-generic \
     kmod \
+    net-tools \
+    iproute2 \
+    ethtool \
+    pciutils \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Create directories
-RUN mkdir -p /opt/ntopng /opt/pfring /etc/nprobe /var/log/nprobe
+# Add universe repository
+RUN add-apt-repository universe
 
-# Download and install PF_RING
-WORKDIR /opt/pfring
-RUN wget https://github.com/ntop/PF_RING/archive/refs/tags/${PFRING_VERSION}.tar.gz \
-    && tar -xzf ${PFRING_VERSION}.tar.gz \
-    && cd PF_RING-${PFRING_VERSION}
+# Download and install ntop repository
+RUN wget https://packages.ntop.org/apt-stable/22.04/all/apt-ntop-stable.deb && \
+    apt install -y ./apt-ntop-stable.deb && \
+    rm apt-ntop-stable.deb
 
-# Build PF_RING userland libraries
-WORKDIR /opt/pfring/PF_RING-${PFRING_VERSION}/userland/lib
-RUN ./configure && make && make install
+# Clean and update package lists
+RUN apt-get clean all && \
+    apt-get update
 
-# Build PF_RING kernel module (for systems where it's needed)
-WORKDIR /opt/pfring/PF_RING-${PFRING_VERSION}/kernel
-RUN make && make install
+# Install PF_RING and nProbe packages
+RUN apt-get install -y \
+    pfring-dkms \
+    nprobe \
+    pfring-drivers-zc-dkms \
+    && rm -rf /var/lib/apt/lists/*
 
-# Build libpcap with PF_RING support
-WORKDIR /opt/pfring/PF_RING-${PFRING_VERSION}/userland/libpcap
-RUN ./configure && make && make install
+# Create directories for configuration and logs
+RUN mkdir -p /opt/nprobe/config \
+             /opt/nprobe/logs \
+             /var/lib/nprobe
 
-# Build tcpdump with PF_RING support
-WORKDIR /opt/pfring/PF_RING-${PFRING_VERSION}/userland/tcpdump
-RUN ./configure && make && make install
+# Create nprobe user for security
+RUN useradd -r -s /bin/false nprobe && \
+    chown -R nprobe:nprobe /opt/nprobe /var/lib/nprobe
 
-# Update library paths
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/ntop.conf
-RUN ldconfig
+# Copy configuration files
+COPY config/nprobe-config.json /opt/nprobe/config/
+COPY scripts/entrypoint.sh /opt/nprobe/
+COPY scripts/start-nprobe.sh /opt/nprobe/
 
-# Download and install nProbe (this would need actual ntop packages or source)
-# Note: You'll need to replace this with actual nProbe installation
-# This is a placeholder as nProbe requires licensing from ntop
-WORKDIR /opt/ntopng
-RUN wget https://packages.ntop.org/apt-stable/22.04/all/apt-ntop-stable.deb \
-    && dpkg -i apt-ntop-stable.deb || true \
-    && apt-get update \
-    && apt-get install -y nprobe || echo "nProbe package not available - install manually"
+# Make scripts executable
+RUN chmod +x /opt/nprobe/entrypoint.sh /opt/nprobe/start-nprobe.sh
 
-# Alternative: If you have nProbe tarball/binary, copy it here
-# COPY nprobe-linux.tar.gz /opt/ntopng/
-# RUN tar -xzf nprobe-linux.tar.gz
+# Expose common NetFlow ports (configurable via config)
+EXPOSE 2055/udp 9995/udp
 
-# Copy configuration and scripts
-COPY config/ /etc/nprobe/
-COPY scripts/ /usr/local/bin/
-RUN chmod +x /usr/local/bin/*.sh
-
-# Create non-root user for security
-RUN useradd -r -s /bin/false nprobe \
-    && chown -R nprobe:nprobe /var/log/nprobe
-
-# Expose ports (adjust based on your configuration)
-EXPOSE 2055/udp 9995/tcp 8080/tcp
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD /usr/local/bin/healthcheck.sh
-
-# Set working directory
-WORKDIR /etc/nprobe
-
-# Default command
-CMD ["/usr/local/bin/start-nprobe.sh"]
+# Set entrypoint
+ENTRYPOINT ["/opt/nprobe/entrypoint.sh"]
