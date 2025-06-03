@@ -1,128 +1,177 @@
-# nProbe Docker Container with PF_RING ZC
-This Docker container packages nProbe with PF_RING Zero Copy (ZC) support for high-performance network flow collection and export.
-Directory Structure
+# nProbe Flow Exporter Docker Container
+This Docker container provides a complete nProbe setup with PF_RING ZC for high-performance packet capture and NetFlow export to external collectors.
+
+## Prerequisites
+
+Docker and Docker Compose installed
+Mellanox NIC with OFED drivers installed on the host
+Privileged container access for packet capture
+Network interface configured for packet capture
+
+## Directory Structure
 nprobe-docker/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── config/
-│   └── config.json
+│   ├── nprobe-config.json
+│   └── license.key (optional)
 ├── scripts/
-│   ├── start-nprobe.sh
-│   ├── healthcheck.sh
-│   ├── setup-pfring.sh
-│   └── monitor-flows.sh
-└── logs/
-    └── (log files will be created here)
-Prerequisites
+│   ├── entrypoint.sh
+│   └── start-nprobe.sh
+├── logs/
+└── licenses/
 
-Docker and Docker Compose installed
-nProbe License from ntop.org
-PF_RING ZC License (if using ZC features)
-Privileged access for kernel module loading
-Network interface available for packet capture
-
-Configuration
-1. Update config.json
-Edit config/config.json to match your environment:
-bash# Essential settings to update:
-{
-  "nprobe": {
-    "license_key": "YOUR_ACTUAL_LICENSE_KEY",
-    "interfaces": [
-      {
-        "name": "eth0",  # Your capture interface
-        "pfring_zc_device": "zc:eth0"  # ZC device specification
-      }
-    ],
-    "collectors": [
-      {
-        "host": "your-collector.example.com",  # Your NetFlow collector
-        "port": 2055
-      }
-    ]
-  }
-}
-2. Set Environment Variables
-Create a .env file:
-bash# License keys
-NPROBE_LICENSE=your_nprobe_license_key_here
-PFRING_ZC_LICENSE=your_pfring_zc_license_key_here
-
-# Optional: Custom configuration
-COLLECTOR_HOST=collector.example.com
-COLLECTOR_PORT=2055
-CAPTURE_INTERFACE=eth0
-Building and Running
-Method 1: Docker Compose (Recommended)
-bash# Build and start the container
-docker-compose up -d --build
-
-# View logs
-docker-compose logs -f nprobe
-
-# Stop the container
-docker-compose down
-Method 2: Docker Build
-bash# Build the image
-docker build -t nprobe-pfring .
-
-# Run the container
-docker run -d \
-  --name nprobe-collector \
-  --privileged \
-  --network host \
-  -v $(pwd)/config:/etc/nprobe:ro \
-  -v $(pwd)/logs:/var/log/nprobe \
-  -v /dev:/dev \
-  -v /proc:/proc \
-  -v /sys:/sys \
-  -v /lib/modules:/lib/modules:ro \
-  -e NPROBE_LICENSE="your_license_here" \
-  nprobe-pfring
-Monitoring and Troubleshooting
-Check Container Status
-bash# Container health
-docker-compose ps
-docker-compose logs nprobe
-
-# Health check
-docker exec nprobe-collector /usr/local/bin/healthcheck.sh
-Monitor Flow Statistics
-bash# Run monitoring script
-docker exec nprobe-collector /usr/local/bin/monitor-flows.sh
-
-# Check nProbe web interface
-curl http://localhost:8080
-Debug Network Issues
-bash# Check interfaces
-docker exec nprobe-collector ip link show
-
-# Test collector connectivity
-docker exec nprobe-collector nc -u -v collector.example.com 2055
-
-# Monitor packets
-docker exec nprobe-collector tcpdump -i eth0 -c 10
-Performance Tuning
-System-Level Optimizations
-bash# Set hugepages (on host system)
-echo 1024 > /proc/sys/vm/nr_hugepages
-
-# CPU isolation (add to kernel boot parameters)
-isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
-
-# IRQ affinity (adjust for your NIC)
-echo 2 > /proc/irq/24/smp_affinity
-Container Configuration
-Update config.json performance settings:
+## Configuration
+### 1. Update nProbe Configuration
+Edit config/nprobe-config.json:
 json{
   "nprobe": {
-    "performance": {
-      "num_threads": 4,
-      "cpu_affinity": true,
-      "packet_buffer_size": 4096,
-      "flow_buffer_size": 2048
+    "capture": {
+      "interface": "enp104s0f0np0",  // Your Mellanox interface
+      "cluster_id": 10,
+      "num_threads": 4
+    },
+    "flow_export": {
+      "collector_ip": "192.168.1.100",  // Your collector IP
+      "collector_port": 2055,
+      "netflow_version": 9
     }
-  },
-  "system": {
-    "hugepages_count": 1024,
-    "
+  }
+}
+### 2. License Configuration (Optional)
+If you have nProbe licenses:
+
+Place license files in licenses/ directory
+Update the license path in nprobe-config.json
+
+### 3. Interface Configuration
+Ensure your Mellanox interface is available:
+
+bash# Check available interfaces
+ip link show
+
+#Verify Mellanox OFED
+ibstat
+
+## Building and Running
+
+### 1. Build the Container
+bash# Clone or create the directory structure
+mkdir -p nprobe-docker/{config,scripts,logs,licenses}
+
+#Copy all files to their respective directories
+#Copy Dockerfile to nprobe-docker/
+#Copy nprobe-config.json to nprobe-docker/config/
+#Copy entrypoint.sh and start-nprobe.sh to nprobe-docker/scripts/
+#Copy docker-compose.yml to nprobe-docker/
+
+#Make scripts executable
+chmod +x scripts/*.sh
+
+#Build the container
+docker-compose build
+
+### 2. Run the Container
+bash# Start the container
+docker-compose up -d
+
+#View logs
+docker-compose logs -f nprobe
+
+#Check container status
+docker-compose ps
+
+### 3. Monitoring
+bash# View real-time logs
+docker-compose logs -f
+
+#Check nProbe process
+docker-compose exec nprobe ps aux | grep nprobe
+
+#Monitor network interface
+docker-compose exec nprobe ip -s link show enp104s0f0np0
+
+## Configuration Options
+### Key Configuration Parameters
+
+interface: Network interface for packet capture (e.g., enp104s0f0np0)
+collector_ip: IP address of the NetFlow collector
+collector_port: Port number of the NetFlow collector
+netflow_version: NetFlow version (5, 9, or 10/IPFIX)
+cluster_id: PF_RING ZC cluster ID for multi-process capture
+num_threads: Number of capture threads
+active_timeout: Active flow timeout in seconds
+inactive_timeout: Inactive flow timeout in seconds
+
+### Performance Tuning
+
+hugepages: Configure hugepages for better performance
+cpu_affinity: Pin processes to specific CPU cores
+ring_buffer_size: Adjust ring buffer size for high-speed capture
+hash_size: Flow hash table size
+
+### Security Options
+
+drop_privileges: Run nProbe as non-root user after initialization
+bind_to_device: Bind to specific network device
+
+## Troubleshooting
+
+### Common Issues
+
+Permission Denied: Ensure container runs with --privileged flag
+Interface Not Found: Verify interface name in configuration
+PF_RING Module: Check if PF_RING kernel module is loaded
+Collector Unreachable: Verify network connectivity to collector
+
+### Debugging Commands
+bash# Check container logs
+docker-compose logs nprobe
+
+#Access container shell
+docker-compose exec nprobe bash
+
+#Check network interfaces
+docker-compose exec nprobe ip link show
+
+#Test collector connectivity
+docker-compose exec nprobe nc -zv <collector_ip> <collector_port>
+
+#Check PF_RING module
+docker-compose exec nprobe lsmod | grep pf_ring
+
+### Log Files
+
+Container logs: docker-compose logs
+nProbe logs: logs/nprobe.log
+System logs: Check host system logs for kernel module issues
+
+## Customization
+### Adding Custom Templates
+Modify the custom_template field in nprobe-config.json:
+json{
+  "nprobe": {
+    "templates": {
+      "custom_template": "%IPV4_SRC_ADDR %IPV4_DST_ADDR %L4_SRC_PORT %L4_DST_PORT %PROTOCOL %IN_BYTES %OUT_BYTES %FIRST_SWITCHED %LAST_SWITCHED",
+      "use_custom_template": true
+    }
+  }
+}
+### Multiple Collectors
+For multiple collectors, modify the flow_export section or run multiple container instances with different configurations.
+
+### Performance Considerations
+
+Use host network mode for best performance
+Configure CPU affinity to avoid core conflicts
+Tune ring buffer sizes based on traffic volume
+Consider using SR-IOV with Mellanox NICs for better isolation
+Monitor container resource usage and adjust limits accordingly
+
+### Production Deployment
+
+Security: Run with minimal privileges where possible
+Monitoring: Implement health checks and alerting
+Backup: Backup configuration files and licenses
+Updates: Regularly update nProbe and PF_RING packages
+Scaling: Consider multiple instances for high-volume environments
