@@ -3,13 +3,14 @@
 import sys
 import os
 from datetime import datetime
-from cprobe_control import cProbeControl 
+from cprobe_control import NProbeController  # Changed from cProbeControl
 from helper_functions import MyLogger
 
 class ProbeCliManager:
     def __init__(self):
         self.logger = MyLogger("cprobe_cli", console=True)
-        self.controller = cProbeControl(None, self.logger)
+        # Initialize with instance number 0 as default
+        self.controller = NProbeController(0)
 
     def print_header(self):
         current_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -27,7 +28,8 @@ class ProbeCliManager:
         print("0. Configure Settings")
         print("5. Exit")
         print(f"\nCurrent Status: {self.controller.get_status()}")
-        print(f"Flow Lock: {'Enabled' if self.controller.lock else 'Disabled'}")
+        # Remove flow lock status as it's not part of NProbeController
+        print("-" * 50)
 
     def configure_settings(self):
         while True:
@@ -41,7 +43,7 @@ class ProbeCliManager:
             print("7.  Set Lifetime Timeout")
             print("8.  Set Debug Level")
             print("9.  Set Aggregation")
-            print("10. Set Bi-directional Mode")
+            print("10. Set Instance Number")
             print("11. Return to Main Menu")
 
             choice = input("\nEnter choice (1-11): ")
@@ -91,31 +93,33 @@ class ProbeCliManager:
             elif choice == '8':
                 try:
                     level = int(input("Enter debug level (1-3): "))
-                    self.controller.debug_level = level
+                    self.controller.settings['debug_level'] = level
+                    self.controller._save_settings()
                 except ValueError:
                     print("Invalid debug level")
             
             elif choice == '9':
                 agg = input("Enter aggregation string (format: VLAN/proto/IP/port/TOS/SCTP/exporter): ")
-                self.controller.aggregation = agg
+                self.controller.settings['aggregation'] = agg
+                self.controller._save_settings()
             
             elif choice == '10':
                 try:
-                    mode = int(input("Enter bi-directional mode (0-2): "))
-                    self.controller.bi_directional = mode
+                    instance = int(input("Enter instance number (0-3): "))
+                    if 0 <= instance <= 3:
+                        # Create new controller with new instance number
+                        self.controller = NProbeController(instance)
+                        print(f"Switched to instance {instance}")
+                    else:
+                        print("Instance number must be between 0 and 3")
                 except ValueError:
-                    print("Invalid mode value")
+                    print("Invalid instance number")
             
             elif choice == '11':
                 break
             
             else:
                 print("Invalid choice")
-
-    def toggle_lock(self):
-        current = self.controller.lock
-        self.controller.lock = not current
-        print(f"Flow lock {'enabled' if not current else 'disabled'}")
 
     def run(self):
         while True:
@@ -140,10 +144,12 @@ class ProbeCliManager:
                 self.controller.restart()
             
             elif choice == '4':
-                self.toggle_lock()
+                print("Flow lock feature is not available in this version")
             
             elif choice == '5':
                 print("Exiting...")
+                # Ensure we stop the nProbe instance before exiting
+                self.controller.stop()
                 break
             
             else:
