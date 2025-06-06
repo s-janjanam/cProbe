@@ -17,7 +17,7 @@ class cProbeControl(object):
     def __init__(self, db, logger):
         self.db = db
         self.ubCfg = ubConfig()
-        self.sys_settings = db.system_settings.find_one({}, {"_id": False})
+        self.sys_settings = JSONSettings('system_settings.json')
         self.logger = logger
         self._my_service_name = 'nprobe'
         self.get_nprobe_version()
