@@ -1,169 +1,91 @@
 #!/bin/bash
 set -e
 
-# Configuration file path
-CONFIG_FILE="/opt/nprobe/config/nprobe-config.json"
+# Source environment variables
+source /opt/nprobe/config/nprobe.env 2>/dev/null || true
 
-# Function to extract configuration values
-get_config() {
-    jq -r "$1" "$CONFIG_FILE"
+# Function to wait for interfaces to be ready
+wait_for_interface() {
+    local interface=$1
+    local max_attempts=30
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        if ip link show "$interface" &>/dev/null; then
+            echo "Interface $interface is ready"
+            return 0
+        fi
+        echo "Waiting for interface $interface (attempt $attempt/$max_attempts)..."
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo "Error: Interface $interface not available after $max_attempts attempts"
+    return 1
 }
 
-# Function to build nProbe command line arguments
-build_nprobe_args() {
-    local args=""
-    
-    # Interface
-    local interface=$(get_config '.nprobe.capture.interface')
-    args="$args -i $interface"
-    
-    # NetFlow version
-    local nf_version=$(get_config '.nprobe.flow_export.netflow_version')
-    args="$args -V $nf_version"
-    
-    # Collector configuration
-    local collector_ip=$(get_config '.nprobe.flow_export.collector_ip')
-    local collector_port=$(get_config '.nprobe.flow_export.collector_port')
-    args="$args -n $collector_ip:$collector_port"
-    
-    # Source IP and port (if specified)
-    local source_ip=$(get_config '.nprobe.flow_export.source_ip')
-    local source_port=$(get_config '.nprobe.flow_export.source_port')
-    if [ "$source_ip" != "0.0.0.0" ] && [ "$source_ip" != "null" ]; then
-        if [ "$source_port" != "0" ] && [ "$source_port" != "null" ]; then
-            args="$args -S $source_ip:$source_port"
-        else
-            args="$args -S $source_ip"
-        fi
+# Check and apply any ZC licenses
+apply_zc_licenses() {
+    local zc_dir="/opt/nprobe/config/zc_licenses"
+    if [ -d "$zc_dir" ]; then
+        for license in "$zc_dir"/*; do
+            if [ -f "$license" ]; then
+                cp "$license" "/etc/pf_ring/zc/"
+            fi
+        done
     fi
-    
-    # Verbose level
-    local verbose=$(get_config '.nprobe.general.verbose_level')
-    args="$args --verbose $verbose"
-    
-    # Template configuration
-    local use_custom_template=$(get_config '.nprobe.templates.use_custom_template')
-    if [ "$use_custom_template" = "true" ]; then
-        local template=$(get_config '.nprobe.templates.custom_template')
-        if [ "$template" != "null" ] && [ "$template" != "" ]; then
-            args="$args -T \"$template\""
-        fi
-    fi
-    
-    # Flow timeouts
-    local active_timeout=$(get_config '.nprobe.flow_export.active_timeout')
-    local inactive_timeout=$(get_config '.nprobe.flow_export.inactive_timeout')
-    if [ "$active_timeout" != "null" ]; then
-        args="$args -t $active_timeout"
-    fi
-    if [ "$inactive_timeout" != "null" ]; then
-        args="$args -d $inactive_timeout"
-    fi
-    
-    # Template refresh rate
-    local template_refresh=$(get_config '.nprobe.flow_export.template_refresh_rate')
-    if [ "$template_refresh" != "null" ]; then
-        args="$args --template-refresh-rate $template_refresh"
-    fi
-    
-    # Hash size
-    local hash_size=$(get_config '.nprobe.flow_processing.hash_size')
-    if [ "$hash_size" != "null" ]; then
-        args="$args --hash-size $hash_size"
-    fi
-    
-    # Max flows
-    local max_flows=$(get_config '.nprobe.flow_processing.max_num_flows')
-    if [ "$max_flows" != "null" ]; then
-        args="$args --max-num-flows $max_flows"
-    fi
-    
-    # Packet sampling
-    local sampling_rate=$(get_config '.nprobe.flow_processing.packet_sampling_rate')
-    if [ "$sampling_rate" != "null" ] && [ "$sampling_rate" != "1" ]; then
-        args="$args --sampling-rate $sampling_rate"
-    fi
-    
-    # PF_RING ZC configuration
-    local pfring_zc=$(get_config '.nprobe.capture.pfring_zc')
-    if [ "$pfring_zc" = "true" ]; then
-        local cluster_id=$(get_config '.nprobe.capture.cluster_id')
-        if [ "$cluster_id" != "null" ]; then
-            args="$args --cluster-id $cluster_id"
-        fi
-        
-        local num_threads=$(get_config '.nprobe.capture.num_threads')
-        if [ "$num_threads" != "null" ]; then
-            args="$args --num-threads $num_threads"
-        fi
-    fi
-    
-    # CPU affinity
-    local cpu_affinity=$(get_config '.nprobe.performance.cpu_affinity')
-    if [ "$cpu_affinity" != "null" ] && [ "$cpu_affinity" != "" ]; then
-        args="$args --cpu-affinity $cpu_affinity"
-    fi
-    
-    # Ring buffer size
-    local ring_buffer=$(get_config '.nprobe.performance.ring_buffer_size')
-    if [ "$ring_buffer" != "null" ]; then
-        args="$args --ring-buffer-size $ring_buffer"
-    fi
-    
-    # Logging
-    local log_file=$(get_config '.nprobe.logging.log_file')
-    if [ "$log_file" != "null" ] && [ "$log_file" != "" ]; then
-        args="$args --log-file $log_file"
-    fi
-    
-    # License file
-    local license_file=$(get_config '.nprobe.licenses.license_file')
-    if [ "$license_file" != "null" ] && [ -f "$license_file" ]; then
-        args="$args --license-file $license_file"
-    fi
-    
-    # PID file
-    local pid_file=$(get_config '.nprobe.general.pid_file')
-    if [ "$pid_file" != "null" ]; then
-        args="$args -P $pid_file"
-    fi
-    
-    # Security: drop privileges
-    local drop_privileges=$(get_config '.nprobe.security.drop_privileges')
-    local user=$(get_config '.nprobe.general.user')
-    if [ "$drop_privileges" = "true" ] && [ "$user" != "null" ]; then
-        args="$args -u $user"
-    fi
-    
-    # Additional advanced options
-    local ignore_vlan=$(get_config '.nprobe.advanced.ignore_vlan')
-    if [ "$ignore_vlan" = "true" ]; then
-        args="$args --ignore-vlan"
-    fi
-    
-    local ignore_mpls=$(get_config '.nprobe.advanced.ignore_mpls')
-    if [ "$ignore_mpls" = "true" ]; then
-        args="$args --ignore-mpls"
-    fi
-    
-    echo "$args"
 }
 
-# Get daemon mode setting
-DAEMON_MODE=$(get_config '.nprobe.general.daemon_mode')
+# Verify nProbe license
+check_nprobe_license() {
+    if [ -f "/opt/nprobe/config/nprobe.license" ]; then
+        cp /opt/nprobe/config/nprobe.license /etc/nprobe.license
+    fi
+}
 
-# Build the command arguments
-NPROBE_ARGS=$(build_nprobe_args)
+# Initialize PF_RING
+init_pf_ring() {
+    local interfaces=(${NPROBE_INTERFACES//,/ })
+    for interface in "${interfaces[@]}"; do
+        wait_for_interface "$interface"
+    done
+    
+    if [ -x "$(command -v pf_ringcfg)" ]; then
+        echo "Configuring PF_RING..."
+        if [ ! -z "$NPROBE_RSS_QUEUES" ]; then
+            pf_ringcfg --configure-driver "$NPROBE_DRIVER" --rss-queues "$NPROBE_RSS_QUEUES"
+        fi
+    fi
+}
 
-# Log the command that will be executed
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Executing nProbe with arguments:"
-echo "nprobe $NPROBE_ARGS"
+# Main startup sequence
+main() {
+    # Initialize PF_RING if needed
+    if [ "$NPROBE_USE_PFRING" = "true" ]; then
+        init_pf_ring
+    fi
 
-# Execute nProbe
-if [ "$DAEMON_MODE" = "true" ]; then
-    # Run as daemon
-    exec nprobe $NPROBE_ARGS -D
-else
-    # Run in foreground
-    exec nprobe $NPROBE_ARGS
-fi
+    # Apply licenses
+    check_nprobe_license
+    apply_zc_licenses
+
+    # Check if we're using Python controller or direct nProbe
+    if [ -f "/opt/nprobe/config/nprobe-0.conf" ]; then
+        echo "Starting nProbe with configuration files..."
+        NUM_INSTANCES=${NPROBE_INSTANCES:-1}
+        for i in $(seq 0 $((NUM_INSTANCES-1))); do
+            nprobe --config-file "/opt/nprobe/config/nprobe-$i.conf" &
+        done
+        wait
+    else
+        echo "Starting nProbe with default configuration..."
+        nprobe -i "${NPROBE_INTERFACE:-any}" \
+            -n "${NPROBE_COLLECTOR:-127.0.0.1:2055}" \
+            -T "${NPROBE_TEMPLATE:-%IPV4_SRC_ADDR %IPV4_DST_ADDR}" \
+            -v "${NPROBE_VERBOSE_LEVEL:-1}" \
+            ${NPROBE_EXTRA_OPTS}
+    fi
+}
+
+# Execute main
+main
