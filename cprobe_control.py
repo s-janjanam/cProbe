@@ -1,145 +1,209 @@
-# Control the operations of nprobe
-from gevent import monkey
-monkey.patch_all()
-
-from HelperFunctions import control_process
+import json
 import os
-from consts import Consts
-import gevent
-import traceback
-from HelperFunctions import makedirs
-from HelperFunctions import remove_file
-import re
-from cpConfig.ub18cfg import Ub18Cfg as ubConfig
+import subprocess
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional, Union
 
+class NProbeConstants:
+    DEFAULT_TEMPLATE = "%IPV4_SRC_ADDR %IPV4_DST_ADDR %IN_BYTES %OUT_BYTES %IN_PKTS %OUT_PKTS"
+    IDLE_TIMEOUT = 300  # 5 minutes
+    LIFETIME_TIMEOUT = 1800  # 30 minutes 
+    FLOW_VERSION = 9  # NetFlow v9
+    DEFAULT_CPUS = {  # Example CPU affinity mapping
+        0: "0",
+        1: "1",
+        2: "2",
+        3: "3"
+    }
+    STATS_FILE_FORMAT = "/opt/nprobe/logs/nprobe-{}.stats"
+    CONFIG_FILE_FORMAT = "/opt/nprobe/config/nprobe-{}.conf"
+    LICENSE_PATH = "/etc/nprobe.license"
+    ZC_LICENSE_DIR = "/etc/pf_ring/zc/"
 
-class cProbeControl(object):
-    def __init__(self, db, logger):
-        self.db = db
-        self.ubCfg = ubConfig()
-        self.sys_settings = JSONSettings('system_settings.json')
-        self.logger = logger
-        self._my_service_name = 'nprobe'
-        self.get_nprobe_version()
-        lic = self.sys_settings.get('cprobe_license', None)
-        if lic:
-            self.license = lic
-        self._compatible_adapter_present = None
-        self._qsfp_mode = None
-        self.get_num_queues_hw()
-        self.get_num_queues_sw()
+class NProbeController:
+    def __init__(self, instance_num: int = 0):
+        self.logger = logging.getLogger("nprobe")
+        self.instance_num = instance_num
+        self.config_file = NProbeConstants.CONFIG_FILE_FORMAT.format(instance_num)
+        self.stats_file = NProbeConstants.STATS_FILE_FORMAT.format(instance_num)
+        self.process = None
+        self._load_settings()
 
-    def target(self):
-        return self.sys_settings.get('cprobe_target', 'none')
-
-    def template(self):
-        return self.sys_settings.get('cprobe_template', Consts.CPROBE_DEFAULT_TEMPLATE)
-
-    def sample_rate(self):
-        pkt_rate = 1
-        flow_collection_rate = 1
-        flow_export_rate = 1
-        sample_rate_str = '{}:{}:{}'.format(pkt_rate, flow_collection_rate, flow_export_rate)
-        return self.sys_settings.get('cprobe_sample_rate', sample_rate_str)
-
-    def sample_rate(self, pkt_rate=1, flow_collection_rate=1, flow_export_rate=1):
-        sample_rate_str = '{}:{}:{}'.format(pkt_rate, flow_collection_rate, flow_export_rate)
-        self.sys_settings.set('cprobe_sample_rate', sample_rate_str)
-        
-    def idle_timeout(self):
-        return self.sys_settings.get('cprobe_idle_timeout', Consts.CPROBE_IDLE_TIMEOUT)
-
-    def idle_timeout(self, level):
-        self.sys_settings.set('cprobe_idle_timeout', level)
-
-    def lifetime_timeout(self):
-        return self.sys_settings.get('cprobe_lifetime_timeout', Consts.CPROBE_LIFETIME_TIMEOUT)
-
-    def lifetime_timeout(self, level):
-        self.sys_settings.set('cprobe_lifetime_timeout', level)
-
-    def flow_version(self):
-        return self.sys_settings.get('cprobe_flow_version', Consts.CPROBE_FLOW_VERSION)
-
-    def flow_version(self, ver):
-        self.sys_settings.set('cprobe_flow_version', ver)
-
-    def license(self):
-        try:
-            with open('/etc/nprobe.license', 'r') as f:
-                return f.read()
-        except (IOError, OSError) as e:
-            return None
-
-    def license(self, lic):
-        try:
-            with open('/etc/nprobe.license', 'w') as f:
-                f.write(lic)
-        except (OSError, TypeError, ValueError) as e:
-            self.logger.debug("Failed to set license to: {}".format(lic))
-
-    def zc_licenses(self):
-        zc_licenses = self.sys_settings.get('cprobe_zc_licenses')
-        if not zc_licenses or len(zc_licenses) <= 0:
-            zc_licenses = [{"id": "", "license": "", "date": ""}]
-        return zc_licenses
-
-    def get_configuration(self):
-        config = {
-            'cprobe_target': self.target,
-            'cprobe_template': self.template,
-            'cprobe_sample_rate': self.sample_rate,
-            'cprobe_flow_version': self.flow_version,
-            'cprobe_lifetime_timeout': self.lifetime_timeout,
-            'cprobe_idle_timeout': self.idle_timeout,
-            'cprobe_system_id': self.system_id,
-            'cprobe_version': self.version,
-            'cprobe_license': self.license,
-            'cprobe_license_date': self.license_date,
-            'cprobe_zc_licenses': self.zc_licenses,
+    def _load_settings(self):
+        """Load settings from JSON configuration"""
+        self.settings = {
+            'interface': None,
+            'target': 'none',
+            'template': NProbeConstants.DEFAULT_TEMPLATE,
+            'sample_rate': '1:1:1',  # pkt:collection:export
+            'flow_version': NProbeConstants.FLOW_VERSION,
+            'lifetime_timeout': NProbeConstants.LIFETIME_TIMEOUT,
+            'idle_timeout': NProbeConstants.IDLE_TIMEOUT,
+            'debug_level': 1,
+            'cpu_affinity': NProbeConstants.DEFAULT_CPUS.get(self.instance_num, "0"),
+            'aggregation': '1/1/1/1/0/0/0',  # VLAN/proto/IP/port/TOS/SCTP/exporter
+            'license': None,
+            'zc_licenses': []
         }
-        return config
-          
-    def write_configuration_nprobe_instance(self, interface):
-        conf_file = Consts.CPROBE_CONF_FILENAME_FORMAT.format(instance_num)
-        with open(conf_file, "w") as fp:
-            fp.write("--interface={}\n".format(interface))
-            fp.write("--cpu-affinity={}\n".format(Consts.CPROBE_CPUS_PROBE[instance_num]))
-            fp.write("--export-thread-affinity={}\n".format(Consts.CPROBE_CPUS_PROBE[instance_num]))
-            fp.write("--verbose={}\n".format(self.debug_level))
-            fp.write("--collector={}\n".format(self.target))
-            fp.write("--flow-templ=\"{}\"\n".format(self.template))
-            fp.write("--aggregation={}\n".format(self.aggregation))
-            fp.write("--sample-rate={}\n".format(self.sample_rate))
-            fp.write("--flow-version={}\n".format(self.flow_version))
-            fp.write("--lifetime-timeout={}\n".format(self.lifetime_timeout))
-            fp.write("--idle-timeout={}\n".format(self.idle_timeout))
+        
+        try:
+            config_path = Path("/opt/nprobe/config/nprobe-config.json")
+            if config_path.exists():
+                with open(config_path) as f:
+                    saved_settings = json.load(f)
+                    self.settings.update(saved_settings)
+        except Exception as e:
+            self.logger.error(f"Failed to load settings: {e}")
+
+    def _save_settings(self):
+        """Save current settings to JSON configuration"""
+        try:
+            config_path = Path("/opt/nprobe/config/nprobe-config.json")
+            with open(config_path, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to save settings: {e}")
+
+    def set_interface(self, interface: str):
+        """Set capture interface"""
+        self.settings['interface'] = interface
+        self._save_settings()
+
+    def set_target(self, target: str):
+        """Set collector target(s)"""
+        self.settings['target'] = target
+        self._save_settings()
+
+    def set_template(self, template: str):
+        """Set flow template"""
+        self.settings['template'] = template
+        self._save_settings()
+
+    def set_sample_rate(self, pkt_rate: int = 1, 
+                       flow_collection_rate: int = 1,
+                       flow_export_rate: int = 1):
+        """Set sampling rates"""
+        self.settings['sample_rate'] = f"{pkt_rate}:{flow_collection_rate}:{flow_export_rate}"
+        self._save_settings()
+
+    def set_timeouts(self, idle_timeout: int = None, lifetime_timeout: int = None):
+        """Set flow timeouts"""
+        if idle_timeout is not None:
+            self.settings['idle_timeout'] = idle_timeout
+        if lifetime_timeout is not None:
+            self.settings['lifetime_timeout'] = lifetime_timeout
+        self._save_settings()
+
+    def set_flow_version(self, version: int):
+        """Set NetFlow version (5, 9, or 10)"""
+        if version in [5, 9, 10]:
+            self.settings['flow_version'] = version
+            self._save_settings()
+        else:
+            raise ValueError("Flow version must be 5, 9, or 10")
+
+    def set_license(self, license_content: str):
+        """Set nProbe license"""
+        try:
+            with open(NProbeConstants.LICENSE_PATH, 'w') as f:
+                f.write(license_content)
+            self.settings['license'] = license_content
+            self._save_settings()
+        except Exception as e:
+            self.logger.error(f"Failed to set license: {e}")
+            raise
+
+    def add_zc_license(self, license_id: str, license_content: str):
+        """Add a Zero Copy license"""
+        try:
+            # Create ZC license directory if it doesn't exist
+            Path(NProbeConstants.ZC_LICENSE_DIR).mkdir(parents=True, exist_ok=True)
             
-    def write_configuration_nprobe(self):
-        makedirs(Consts.CPROBE_CONF_PATH, exist_ok=True)
-        interface = sorted(Consts.TRAFFIC_ADDRESSES)[0]
-        self.write_configuration_nprobe_instance(0, interface)
+            # Write license file
+            license_path = Path(NProbeConstants.ZC_LICENSE_DIR) / license_id
+            with open(license_path, 'w') as f:
+                f.write(license_content)
+
+            # Update settings
+            self.settings['zc_licenses'].append({
+                'id': license_id,
+                'license': license_content,
+                'date': ''  # Will be populated when validated
+            })
+            self._save_settings()
+        except Exception as e:
+            self.logger.error(f"Failed to add ZC license: {e}")
+            raise
 
     def write_configuration(self):
-        self.write_configuration_cluster()
-        self.write_configuration_nprobe()
+        """Write nProbe configuration file"""
+        try:
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            with open(self.config_file, 'w') as fp:
+                if self.settings['interface']:
+                    fp.write(f"--interface={self.settings['interface']}\n")
+                fp.write(f"--netflow-engine=0:{self.instance_num}\n")
+                fp.write(f"--cpu-affinity={self.settings['cpu_affinity']}\n")
+                fp.write(f"--verbose={self.settings['debug_level']}\n")
+                
+                if self.settings['target'] != 'none':
+                    for target in self.settings['target'].split(','):
+                        fp.write(f"--collector={target.strip()}\n")
+                
+                fp.write(f"--flow-templ=\"{self.settings['template']}\"\n")
+                fp.write(f"--dump-stats={self.stats_file}\n")
+                fp.write(f"--aggregation={self.settings['aggregation']}\n")
+                fp.write(f"--sample-rate={self.settings['sample_rate']}\n")
+                fp.write(f"--flow-version={self.settings['flow_version']}\n")
+                fp.write(f"--lifetime-timeout={self.settings['lifetime_timeout']}\n")
+                fp.write(f"--idle-timeout={self.settings['idle_timeout']}\n")
 
-    def start(self, all_services=False):
-        self.write_configuration()
-        if self.enable_balancer:
-            control_process("cluster@{}".format(Consts.CPROBE_CLUSTER_ID), 'start')
-            gevent.sleep(1.0)
+                # Add any custom advanced options
+                if 'advanced_options' in self.settings:
+                    for opt in self.settings['advanced_options']:
+                        fp.write(f"{opt}\n")
 
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'start')
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to write configuration: {e}")
+            return False
 
-    def stop(self, all_services=False):
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'stop')
-        if all_services:
-            control_process("cluster@{}".format(Consts.CPROBE_CLUSTER_ID), 'stop')
+    def start(self) -> bool:
+        """Start nProbe instance"""
+        try:
+            if not self.write_configuration():
+                return False
 
-    def restart(self, all_services=False):
-        self.write_configuration()
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'restart')
+            cmd = f"nprobe --config-file {self.config_file}"
+            self.process = subprocess.Popen(cmd.split())
+            self.logger.info(f"Started nProbe instance {self.instance_num}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to start nProbe: {e}")
+            return False
+
+    def stop(self) -> bool:
+        """Stop nProbe instance"""
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=10)
+                self.process = None
+                self.logger.info(f"Stopped nProbe instance {self.instance_num}")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to stop nProbe: {e}")
+                return False
+        return True
+
+    def restart(self) -> bool:
+        """Restart nProbe instance"""
+        self.stop()
+        return self.start()
+
+    def get_status(self) -> str:
+        """Get nProbe instance status"""
+        if not self.process:
+            return "stopped"
+        return "running" if self.process.poll() is None else "stopped"
