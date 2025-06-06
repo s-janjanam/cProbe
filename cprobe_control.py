@@ -3,14 +3,10 @@ from gevent import monkey
 monkey.patch_all()
 
 from HelperFunctions import control_process
-from HelperFunctions import run_cmd
-from HelperFunctions import run_cmd_e
 import os
 from consts import Consts
 import gevent
 import traceback
-from gevent import subprocess
-from HelperFunctions import rm_files_in_dir
 from HelperFunctions import makedirs
 from HelperFunctions import remove_file
 import re
