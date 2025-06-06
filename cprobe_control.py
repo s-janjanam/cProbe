@@ -1,895 +1,209 @@
-# Control the operations of nprobe
-from gevent import monkey
-monkey.patch_all()
-
-from HelperFunctions import control_process
-from HelperFunctions import run_cmd
-from HelperFunctions import run_cmd_e
+import json
 import os
-from consts import Consts
-import gevent
-import traceback
-from gevent import subprocess
-from HelperFunctions import rm_files_in_dir
-from HelperFunctions import makedirs
-from HelperFunctions import remove_file
-import re
-from cpConfig.ub18cfg import Ub18Cfg as ubConfig
+import subprocess
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional, Union
 
+class NProbeConstants:
+    DEFAULT_TEMPLATE = "%IPV4_SRC_ADDR %IPV4_DST_ADDR %IN_BYTES %OUT_BYTES %IN_PKTS %OUT_PKTS"
+    IDLE_TIMEOUT = 300  # 5 minutes
+    LIFETIME_TIMEOUT = 1800  # 30 minutes 
+    FLOW_VERSION = 9  # NetFlow v9
+    DEFAULT_CPUS = {  # Example CPU affinity mapping
+        0: "0",
+        1: "1",
+        2: "2",
+        3: "3"
+    }
+    STATS_FILE_FORMAT = "/opt/nprobe/logs/nprobe-{}.stats"
+    CONFIG_FILE_FORMAT = "/opt/nprobe/config/nprobe-{}.conf"
+    LICENSE_PATH = "/etc/nprobe.license"
+    ZC_LICENSE_DIR = "/etc/pf_ring/zc/"
 
-"""
---redis <host>[:<port>]             | Connected to the specified redis server
-                                    | Example --redis localhost
---l7-aggregation <mode>             | Enable data aggregation in redis (--redis required)
-                                    | 1 - Aggregate hourly (redis key nprobe.l7_xxx.epoch)
-                                    | 2 - Aggregate daily (redis key nprobe.l7_xxx.epoch)
-                                    | 3 - Aggregate totals (redis key nprobe.l7_totals)
-                                    | Where epoch is the current epoch modulus 3600 (hourly)
-                                    | and 86400 (daily) and xxx is bytes/pkts.
-[--in-iface-idx|-u] <in dev idx>    | Index of the input device used in the
-                                    | emitted flows (incoming traffic). Default
-                                    | value is 0. Use -1 as value to dynamically
-                                    | set to the last two bytes of
-                                    | the MAC address of the flow sender.
-[--out-iface-idx|-Q] <out dev idx>  | Index of the output device used in the
-                                    | emitted flows (outgoing traffic). Default
-                                    | value is 0. Use -1 as value to dynamically
-                                    | set to the last two bytes of
-                                    | the MAC address of the flow receiver.
-[--bpf-filter|-f] <BPF filter>      | BPF filter for captured packets
-                                    | [default=no filter]
-[--min-flow-size|-z] <TCP[:UDP[:O]]>| Minimum flow size (in bytes).
-                                    | If a flow is shorter than the
-                                    | specified size the flow is not
-                                    | emitted. Flow size can be specified
-                                    | for TCP, UDP and Other flows, with Other
-                                    | meaning neither TCP nor UDP.
-                                    | [default=no_min/no_min/no_min]
-[--flow-version|-V] <version>       | NetFlow Version: 5=NFv5, 9=NFv9, 10=IPFIX
---black-list <networks>             | All the IPv4 hosts inside the networks
-                                    | black-list will be discarded.
-                                    | This reduces the load on the probe
-                                    | instead of discarding flows on the
-                                    | collector side.
-"""
+class NProbeController:
+    def __init__(self, instance_num: int = 0):
+        self.logger = logging.getLogger("nprobe")
+        self.instance_num = instance_num
+        self.config_file = NProbeConstants.CONFIG_FILE_FORMAT.format(instance_num)
+        self.stats_file = NProbeConstants.STATS_FILE_FORMAT.format(instance_num)
+        self.process = None
+        self._load_settings()
 
-
-class cProbeControl(object):
-    def __init__(self, db, logger):
-        self.db = db
-        self.ubCfg = ubConfig()
-        self.sys_settings = db.system_settings.find_one({}, {"_id": False})
-        self.logger = logger
-        self._my_service_name = 'nprobe'
-        self.get_nprobe_version()
-        lic = self.sys_settings.get('cprobe_license', None)
-        if lic:
-            self.license = lic
-        self._compatible_adapter_present = None
-        self._qsfp_mode = None
-        self.get_num_queues_hw()
-        self.get_num_queues_sw()
-
-    @property
-    def enable_balancer(self):
-        return self.sys_settings.get('cprobe_enable_balancer', True)
-
-    @enable_balancer.setter
-    def enable_balancer(self, value):
-        try:
-            self.db.system_settings.update_one({}, {"$set": {'cprobe_enable_balancer': value}})
-        except Exception as e:
-            self.logger.error('Error in setting {} for balancer - {}'.format(value, e))
-
-    @property
-    def num_queues_hw(self):
-        return int(self.sys_settings.get('cprobe_num_queues_hw', Consts.CPROBE_NUM_QUEUES_HW))
-
-    @num_queues_hw.setter
-    def num_queues_hw(self, num_queues):
-        try:
-            self.db.system_settings.update_one({}, {"$set": {'cprobe_num_queues_hw': num_queues}})
-        except Exception as e:
-            self.logger.error('Error in setting #queues (hardware) to {} - {}'.format(num_queues, e))
-
-    @property
-    def num_queues_sw(self):
-        return int(self.sys_settings.get('cprobe_num_queues_sw', Consts.CPROBE_NUM_QUEUES_SW))
-
-    @num_queues_sw.setter
-    def num_queues_sw(self, num_queues):
-        try:
-            self.db.system_settings.update_one({}, {"$set": {'cprobe_num_queues_sw': num_queues}})
-        except Exception as e:
-            self.logger.error('Error in setting #queues (software) to {} - {}'.format(num_queues, e))
-
-    @property
-    def target(self):
-        return self.sys_settings.get('cprobe_target', 'none')
-
-    @property
-    def target_all(self):
-        """
-        --all-collectors
-             Send flows to all collectors, else send flows in a round-robin fashion
-        """
-        return self.sys_settings.get('cprobe_target_all', True)
-
-    @property
-    def template(self):
-        # template documentation (as much as it is...):
-        # https://www.cisco.com/en/US/technologies/tk648/tk362/technologies_white_paper09186a00800a3db9.html
-        return self.sys_settings.get('cprobe_template', Consts.CPROBE_DEFAULT_TEMPLATE)
-
-    @property
-    def flow_lock_file(self):
-        """
-        [--flow-lock|-C] <flow lock>
-        If the flow lock file is present no flows are emitted. This facility is useful to
-         implement high availability by means of a daemon that can create a lock file when this instance is in standby.
-        """
-        return self.sys_settings.get('cprobe_flow_lock', Consts.CPROBE_LOCK_FILE)
-
-    def _create_lock_file(self, lock):
-        try:
-            if lock:
-                with open(self.flow_lock_file, "w+") as f:
-                    pass
-            else:
-                if os.path.exists(self.flow_lock_file):
-                    os.remove(self.flow_lock_file)
-        except OSError:
-            self.logger.debug("Failed to execute flow {} action".format("lock" if self.lock else "unlock"))
-
-    @property
-    def lock(self):
-        return self.sys_settings.get('cprobe_lock', False)
-
-    @lock.setter
-    def lock(self, lock):
-        self.logger.debug("Trying to {} flows".format("lock" if lock else "unlock"))
-        self.db.system_settings.update({}, {"$set": {'cprobe_lock': True if lock else False}})
-        self._create_lock_file(lock)
-
-    @property
-    def aggregation(self):
-        """
-        [--aggregation|-p] <aggregation>
-         Flows can be aggregated both at collector and probe side. However probe allocation is much more effective
-              as it reduces significantly the number of emitted flows hence the work that the collector has to carry on.
-              nProbe supports various aggregation levels that can be selected specifying with the -p flag.
-              The aggregation format is <VLAN Id>/<proto>/<IP>/<port>/<TOS>/<SCTP StreamId>/<exporter IP>
-              where each option can be set to 0 (ignore) or 1 (take care). Ignored fields are set to a null value
-              when doing the aggregation as well as when doing the export.
-         For example setting the <exporter IP> to 0 (ignore) will consider all the incoming flows as if they were
-          coming from the same null exporter that will be output in %EXPORTER_IPV4_ADDRESS as 0.0.0.0. By default no
-          aggregation is performed. For the sake of example, the value 0/0/1/0/0/0/0 can be used to create a map of
-          who's talking to who (network conversation matrix).
-        """
-        VLAN_ID = 1
-        proto = 1
-        IP = 1
-        port = 1
-        TOS = 0
-        SCTP_stream_id = 0
-        exporter_IP = 0
-        aggregation_str = '{}/{}/{}/{}/{}/{}/{}'.format(VLAN_ID, proto, IP, port, TOS, SCTP_stream_id, exporter_IP)
-        return self.sys_settings.get('cprobe_aggregation', aggregation_str)
-
-    @aggregation.setter
-    def aggregation(self, VLAN_ID=1, proto=1, IP=1, port=1, TOS=0, SCTP_stream_id=0, exporter_IP=0):
-        aggregation_str = '{}/{}/{}/{}/{}/{}/{}'.format(VLAN_ID, proto, IP, port, TOS, SCTP_stream_id, exporter_IP)
-        self.db.system_settings.update({}, {"$set": {'cprobe_aggregation': aggregation_str}})
-
-    @property
-    def sample_rate(self):
-        """
-        [--sample-rate|-S] pkt_rate:flow_collection_rate:flow_export_rate
-
-        Three different rates can be specified with this option:
-
-            Packet capture sampling rate 'pkt rate'. This rate is effective for interfaces specified with -i and allows
-            to control the sampling rate of incoming packets. For example, a sampling rate of 100 will instruct nprobe
-            to actually process one packet out of 100, discarding all the others.
-            'pkt rate' can be prepended with a '@' to instruct nprobe to only use the sampling rate for the up-scaling,
-            without performing any actual sampling. This is particularly useful when incoming packets are already
-            sampled on the capture device connected to nprobe but it is still meaningful to have up-scaled statistics.
-
-            Flow collection sampling rate 'flow collection rate'. This rate works when nprobe is in collector mode,
-            that is, when option --collector-port is used and specifies the flow rate at which flows being collected
-            have been sampled. In this case, no actual sampling is performed on the incoming flows. The specified rate
-            is only used to perform the upscaling. For example, a flow with 250 IN_BYTES will be up-scaled by a factor
-            equal to the sampling rate. If the sampling rate is 100, a total of 2500 IN_BYTES will be accounted for
-            that flow.
-
-            Flow export rate 'flow export rate'. This rate is effective when nprobe exports NetFlow towards a
-            downstream collector, that is, when option -n is used. It controls the output sampling. For example, a
-            'flow export rate' of 100 will cause nprobe to only export 1 flow out of 100 towards the downstream
-            collector.
-        """
-        pkt_rate = 1
-        flow_collection_rate = 1
-        flow_export_rate = 1
-        sample_rate_str = '{}:{}:{}'.format(pkt_rate, flow_collection_rate, flow_export_rate)
-        return self.sys_settings.get('cprobe_sample_rate', sample_rate_str)
-
-    @sample_rate.setter
-    def sample_rate(self, pkt_rate=1, flow_collection_rate=1, flow_export_rate=1):
-        sample_rate_str = '{}:{}:{}'.format(pkt_rate, flow_collection_rate, flow_export_rate)
-        self.db.system_settings.update({}, {"$set": {'cprobe_sample_rate': sample_rate_str}})
-
-    @property
-    def advanced_options(self):
-        """
-        Custom nprobe options added by users
-        """
-        default_advanced_options = {"enable": False, "options": [{}]}
-        advanced_opts = self.sys_settings.get('cprobe_advanced_options', default_advanced_options)
-        if "enable" not in advanced_opts:
-            advanced_opts['enable'] = False
-        if "options" not in advanced_opts:
-            advanced_opts['options'] = [{}]
-        return advanced_opts
-
-    @advanced_options.setter
-    def advanced_options(self, options=None):
-        if not options:
-            options = {"enable": False, "options": [{}]}
-        self.db.system_settings.update({}, {"$set": {'cprobe_advanced_options': options}})
-
-    @property
-    def bi_directional(self):
-        """
-        Bi-directional flows are such when there is traffic in both direction of the flow (i.e.
-        source->dest and dest->source). As mono-directional flows might indicate suspicious activities,
-         this flag is used to determine the export policy:
-            0: Export all know (i.e. mono and bi-directional flows)
-            1: Export only bi-directional flows, discarding mono-directional flows.
-            2: Export only mono-directional flows, discarding bi-directional flows.
-        """
-        return self.sys_settings.get('cprobe_bi_directional', 0)
-
-    @bi_directional.setter
-    def bi_directional(self, bi_di):
-        try:
-            self.db.system_settings.update({}, {"$set": {'cprobe_bi_directional': int(bi_di)}})
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Failed to set bidirectional version to: {}".format(bi_di))
-
-    @property
-    def debug_level(self):
-        try:
-            level = self.sys_settings.get('cprobe_debug_level', 1)
-            level = int(level)
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Bad value for debug level: {}".format(level))
-            level = 1
-        return level
-
-    @debug_level.setter
-    def debug_level(self, level):
-        try:
-            self.db.system_settings.update({}, {"$set": {'cprobe_debug_level': int(level)}})
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Failed to set debug level to: {}".format(level))
-
-    @property
-    def idle_timeout(self):
-        return self.sys_settings.get('cprobe_idle_timeout', Consts.CPROBE_IDLE_TIMEOUT)
-
-    @idle_timeout.setter
-    def idle_timeout(self, level):
-        try:
-            self.db.system_settings.update({}, {"$set": {'cprobe_idle_timeout': int(level)}})
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Failed to set idle timeout: {}".format(level))
-
-    @property
-    def lifetime_timeout(self):
-        return self.sys_settings.get('cprobe_lifetime_timeout', Consts.CPROBE_LIFETIME_TIMEOUT)
-
-    @lifetime_timeout.setter
-    def lifetime_timeout(self, level):
-        try:
-            self.db.system_settings.update({}, {"$set": {'cprobe_lifetime_timeout': int(level)}})
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Failed to set life time timeout: {}".format(level))
-
-    @property
-    def dedup(self):
-        """
-        --enable-ipv4-deduplication
-             By default IPv4 frames hw-duplicated are not detected and discarded. Use this option to enable
-             IPv4 hw-deduplication
-        """
-        return self.sys_settings.get('cprobe_enable_dedup', False)
-
-    @dedup.setter
-    def dedup(self, enable):
-        self.db.system_settings.update({}, {"$set": {'cprobe_enable_dedup': True if enable else False}})
-
-    @property
-    def flow_version(self):
-        """
-            Used to specify the flow version for exported flows. Supported versions are 5 (v5), 9 (v9) and 10 (IPFIX).
-        """
-        return self.sys_settings.get('cprobe_flow_version', Consts.CPROBE_FLOW_VERSION)
-
-    @flow_version.setter
-    def flow_version(self, ver):
-        try:
-            self.db.system_settings.update({}, {"$set": {'cprobe_flow_version', int(ver)}})
-        except (TypeError, ValueError) as e:
-            self.logger.debug("Failed to set the flow version to: {}".format(ver))
-
-    @property
-    def version(self):
-        return self.sys_settings.get('cprobe_version', 0)
-
-    @property
-    def system_id(self):
-        return self.sys_settings.get('cprobe_system_id', 0)
-
-    @property
-    def order_id(self):
-        return self.sys_settings.get('cprobe_order_id', 0)
-
-    @property
-    def license_date(self):
-        return self.sys_settings.get('cprobe_license_date', None)
-
-    @property
-    def license(self):
-        try:
-            with open('/etc/nprobe.license', 'r') as f:
-                return f.read()
-        except (IOError, OSError) as e:
-            self.logger.debug("Failed to read license: {}".format(e))
-            return None
-
-    @license.setter
-    def license(self, lic):
-        try:
-            with open('/etc/nprobe.license', 'w') as f:
-                f.write(lic)
-        except (OSError, TypeError, ValueError) as e:
-            self.logger.debug("Failed to set license to: {}".format(lic))
-
-    @property
-    def zc_licenses(self):
-        zc_licenses = self.sys_settings.get('cprobe_zc_licenses')
-        if not zc_licenses or len(zc_licenses) <= 0:
-            zc_licenses = [{"id": "", "license": "", "date": ""}]
-        return zc_licenses
-
-    def get_configuration(self):
-        config = {
-            'cprobe_target': self.target,
-            'cprobe_template': self.template,
-            'cprobe_lock': self.lock,
-            'cprobe_aggregation': self.aggregation,
-            'cprobe_sample_rate': self.sample_rate,
-            'cprobe_advanced_options': self.advanced_options,
-            'cprobe_dedup': self.dedup,
-            'cprobe_flow_version': self.flow_version,
-            'cprobe_bi_directional': self.bi_directional,
-            'cprobe_debug_level': self.debug_level,
-            'cprobe_lifetime_timeout': self.lifetime_timeout,
-            'cprobe_idle_timeout': self.idle_timeout,
-            'cprobe_system_id': self.system_id,
-            'cprobe_version': self.version,
-            'cprobe_license': self.license,
-            'cprobe_license_date': self.license_date,
-            'cprobe_zc_licenses': self.zc_licenses,
+    def _load_settings(self):
+        """Load settings from JSON configuration"""
+        self.settings = {
+            'interface': None,
+            'target': 'none',
+            'template': NProbeConstants.DEFAULT_TEMPLATE,
+            'sample_rate': '1:1:1',  # pkt:collection:export
+            'flow_version': NProbeConstants.FLOW_VERSION,
+            'lifetime_timeout': NProbeConstants.LIFETIME_TIMEOUT,
+            'idle_timeout': NProbeConstants.IDLE_TIMEOUT,
+            'debug_level': 1,
+            'cpu_affinity': NProbeConstants.DEFAULT_CPUS.get(self.instance_num, "0"),
+            'aggregation': '1/1/1/1/0/0/0',  # VLAN/proto/IP/port/TOS/SCTP/exporter
+            'license': None,
+            'zc_licenses': []
         }
-        self.logger.debug("Returning cProbe configuration: {}".format(config))
-        return config
-
-    def _write_target(self, fp):
+        
         try:
-            # eliminate inner and outer whitespaces, avoid empty items
-            target_list = [t.strip() for t in self.target.strip().split(',') if t.strip()]
-            for t in target_list:
-                fp.write("--collector={}\n".format(t))
-            if self.target_all:
-                fp.write("--all-collectors\n")
+            config_path = Path("/opt/nprobe/config/nprobe-config.json")
+            if config_path.exists():
+                with open(config_path) as f:
+                    saved_settings = json.load(f)
+                    self.settings.update(saved_settings)
         except Exception as e:
-            self.logger.error("Failed to write targets {}: {}".format(self.target, str(e)))
+            self.logger.error(f"Failed to load settings: {e}")
 
-    def _write_advanced_configuration_nprobe(self, fp):
+    def _save_settings(self):
+        """Save current settings to JSON configuration"""
         try:
-            options_enabled = self.advanced_options.get("enable", False)
-            if not options_enabled:
-                self.logger.debug("cprobe advanced options are disabled")
-                return
-            for op in self.advanced_options.get("options", []):
-                op_key = op.get("key")
-                op_val = op.get("value")
-                if op_key and op_val:
-                    fp.write("{}={}\n".format(op_key, op_val))
+            config_path = Path("/opt/nprobe/config/nprobe-config.json")
+            with open(config_path, 'w') as f:
+                json.dump(self.settings, f, indent=2)
         except Exception as e:
-            self.logger.error("Failed to write advanced cprobe options: {} - {}".format(
-                              self.advanced_options, e))
+            self.logger.error(f"Failed to save settings: {e}")
 
-    def write_configuration_nprobe_instance(self, instance_num, interface):
-        import pwd
-        import grp
-        uid = pwd.getpwnam("nprobe").pw_uid
-        gid = grp.getgrnam("nprobe").gr_gid
-        stats_file = Consts.CPROBE_STATS_FILENAME_FORMAT.format(instance_num)
-        conf_file = Consts.CPROBE_CONF_FILENAME_FORMAT.format(instance_num)
-        # Create the stats file
-        with open(stats_file, "w+") as f:
-            pass
-        os.chown(stats_file, uid, gid)
-        with open(conf_file, "w") as fp:
-            fp.write("--interface={}\n".format(interface))
-            fp.write("--netflow-engine=0:{}\n".format(instance_num))
-            fp.write("--cpu-affinity={}\n".format(Consts.CPROBE_CPUS_PROBE[instance_num]))
-            fp.write("--export-thread-affinity={}\n".format(Consts.CPROBE_CPUS_PROBE[instance_num]))
-            fp.write("--verbose={}\n".format(self.debug_level))
-            self._write_target(fp)
-            fp.write("--flow-templ=\"{}\"\n".format(self.template))
-            fp.write("--dump-stats={}\n".format(stats_file))
-            fp.write("--flow-lock={}\n".format(self.flow_lock_file))
-            fp.write("--aggregation={}\n".format(self.aggregation))
-            fp.write("--sample-rate={}\n".format(self.sample_rate))
-            fp.write("--biflows-export-policy={}\n".format(self.bi_directional))
-            fp.write("--flow-version={}\n".format(self.flow_version))
-            fp.write("--lifetime-timeout={}\n".format(self.lifetime_timeout))
-            fp.write("--idle-timeout={}\n".format(self.idle_timeout))
-            if self.dedup:
-                fp.write("--enable-ipv4-deduplication\n")
-            self._write_advanced_configuration_nprobe(fp)
+    def set_interface(self, interface: str):
+        """Set capture interface"""
+        self.settings['interface'] = interface
+        self._save_settings()
 
-    def get_interface_nprobe_instance(self, n):
-        # Get the interface name from which nprobe reads the packet
-        # This could be a physical interface queue of the form zc:eth2@queue
-        # a logical queue of the form cluster_id@queue_id if the software
-        # balancer is enabled.
-        if self.get_qsfp_mode() == Consts.QSFP_MODE_4x10:
-            # software balancer is not enabled in 4x10 mode
-            num_queues_4x10 = self.num_queues_hw / Consts.QSFP_CHANNELS_4x10
-            traffic_addresses = sorted(Consts.TRAFFIC_ADDRESSES)
-            iface_index = n / num_queues_4x10
-            if iface_index >= len(traffic_addresses):
-                # An unlikely safety check to avoid "list index outside range" exception
-                self.logger.warn("Interface at index {} unavailable. Total: {}".format(iface_index, len(traffic_addresses)))
-                return None
-            interface = traffic_addresses[iface_index]
-            interface = "zc:{}@{}".format(interface, n % num_queues_4x10)
+    def set_target(self, target: str):
+        """Set collector target(s)"""
+        self.settings['target'] = target
+        self._save_settings()
+
+    def set_template(self, template: str):
+        """Set flow template"""
+        self.settings['template'] = template
+        self._save_settings()
+
+    def set_sample_rate(self, pkt_rate: int = 1, 
+                       flow_collection_rate: int = 1,
+                       flow_export_rate: int = 1):
+        """Set sampling rates"""
+        self.settings['sample_rate'] = f"{pkt_rate}:{flow_collection_rate}:{flow_export_rate}"
+        self._save_settings()
+
+    def set_timeouts(self, idle_timeout: int = None, lifetime_timeout: int = None):
+        """Set flow timeouts"""
+        if idle_timeout is not None:
+            self.settings['idle_timeout'] = idle_timeout
+        if lifetime_timeout is not None:
+            self.settings['lifetime_timeout'] = lifetime_timeout
+        self._save_settings()
+
+    def set_flow_version(self, version: int):
+        """Set NetFlow version (5, 9, or 10)"""
+        if version in [5, 9, 10]:
+            self.settings['flow_version'] = version
+            self._save_settings()
         else:
-            if self.enable_balancer:
-                interface = "zc:{}@{}".format(Consts.CPROBE_CLUSTER_ID, n)
-            else:
-                interface = sorted(Consts.TRAFFIC_ADDRESSES)[0]
-                interface = "zc:{}@{}".format(interface, n)
-        return interface
+            raise ValueError("Flow version must be 5, 9, or 10")
 
-    def get_num_queues_hw(self):
-        # Disable software balancer in 4x10 mode
-        if self.detect_compatible_adapter() and self.get_qsfp_mode() == Consts.QSFP_MODE_4x10 and self.enable_balancer:
-            self.logger.warn('Software distribution is not supported in 4x10 mode, disabling...')
-            self.enable_balancer = False
+    def set_license(self, license_content: str):
+        """Set nProbe license"""
+        try:
+            with open(NProbeConstants.LICENSE_PATH, 'w') as f:
+                f.write(license_content)
+            self.settings['license'] = license_content
+            self._save_settings()
+        except Exception as e:
+            self.logger.error(f"Failed to set license: {e}")
+            raise
 
-        # If cprobe_num_queues_hw is configured correctly, there is nothing else to be done here
-        if self.num_queues_hw in Consts.CPROBE_NUM_QUEUES_HW_SUPPORTED:
-            return
+    def add_zc_license(self, license_id: str, license_content: str):
+        """Add a Zero Copy license"""
+        try:
+            # Create ZC license directory if it doesn't exist
+            Path(NProbeConstants.ZC_LICENSE_DIR).mkdir(parents=True, exist_ok=True)
+            
+            # Write license file
+            license_path = Path(NProbeConstants.ZC_LICENSE_DIR) / license_id
+            with open(license_path, 'w') as f:
+                f.write(license_content)
 
-        # update cprobe_num_queues_hw to the default supported value
-        self.logger.debug("Unsupported #queues (hardware):{} Override with {}".format(
-            self.num_queues_hw, Consts.CPROBE_NUM_QUEUES_HW))
-        self.num_queues_hw = Consts.CPROBE_NUM_QUEUES_HW
-
-    def get_num_queues_sw(self):
-        # If cprobe_num_queues_sw is configured correctly, there is nothing else to be done here
-        if self.num_queues_sw in Consts.CPROBE_NUM_QUEUES_SW_SUPPORTED:
-            return self.num_queues_sw
-
-        # update cprobe_num_queues_sw to the default supported value
-        self.logger.debug("Unsupported #queues (software):{} Override with {}".format(
-            self.num_queues_sw, Consts.CPROBE_NUM_QUEUES_SW))
-        self.num_queues_sw = Consts.CPROBE_NUM_QUEUES_SW
-
-    def write_configuration_nprobe(self):
-        makedirs(Consts.CPROBE_CONF_PATH, exist_ok=True)
-        if self.detect_compatible_adapter():
-            num = self.num_queues_sw if self.enable_balancer else self.num_queues_hw
-            for n in range(0, num):
-                interface = self.get_interface_nprobe_instance(n)
-                if not interface:
-                    # This is a safety check to avoid writing configurations for
-                    # an interface that is not available (yet) due to a change in
-                    # qsfp mode that has not been applied (by performing a reboot).
-                    break
-                self.write_configuration_nprobe_instance(n, interface)
-            # Remove rest of the config / stats files if present
-            for n in range(num, Consts.CPROBE_MAX_QUEUES):
-                remove_file(Consts.CPROBE_STATS_FILENAME_FORMAT.format(n), True)
-                remove_file(Consts.CPROBE_CONF_FILENAME_FORMAT.format(n), True)
-        else:
-            interface = sorted(Consts.TRAFFIC_ADDRESSES)[0]
-            self.write_configuration_nprobe_instance(0, interface)
-        # lock file is common to all nprobe processes
-        self._create_lock_file(self.lock)
-
-    def write_configuration_cluster(self):
-        makedirs(Consts.CPROBE_CLUSTER_CONF_DIR, exist_ok=True)
-        cluster_config_file = "cluster-{}.conf".format(Consts.CPROBE_CLUSTER_ID)
-        cluster_config_path = os.path.join(Consts.CPROBE_CLUSTER_CONF_DIR, cluster_config_file)
-        # Create a c cluster configuration file if a software balancer is enabled
-        if self.enable_balancer and self.detect_compatible_adapter():
-            self.logger.debug("Creating cluster configuration {}".format(cluster_config_path))
-            interface = sorted(Consts.TRAFFIC_ADDRESSES)[0]
-            try:
-                with open(cluster_config_path, "w") as fp:
-                    fp.write("-i=zc:{}\n".format(interface))
-                    fp.write("-c={}\n".format(Consts.CPROBE_CLUSTER_ID))
-                    fp.write("-n={}\n".format(self.num_queues_sw))
-                    fp.write("-m={}\n".format(Consts.CPROBE_HASH_MODE))
-                    fp.write("-S={}\n".format(Consts.CPROBE_CPU_TIME_PULSE))
-                    fp.write("-R={}\n".format(Consts.CPROBE_TIME_RES_NSEC))
-                    fp.write("-g={}\n".format(Consts.CPROBE_CPU_BALANCER))
-                    fp.write("-q={}\n".format(Consts.CPROBE_QUEUE_SLOTS))
-                    fp.write("-p\n")
-            except OSError as e:
-                self.logger.debug("error in writing to {}: {}".format(cluster_config_path, e))
-        else:
-            self.logger.debug("Removing cluster configuration {}".format(cluster_config_path))
-            try:
-                if os.path.isfile(cluster_config_path):
-                    os.remove(cluster_config_path)
-            except OSError as e:
-                self.logger.debug("error in removing {}: {}".format(cluster_config_path, e))
+            # Update settings
+            self.settings['zc_licenses'].append({
+                'id': license_id,
+                'license': license_content,
+                'date': ''  # Will be populated when validated
+            })
+            self._save_settings()
+        except Exception as e:
+            self.logger.error(f"Failed to add ZC license: {e}")
+            raise
 
     def write_configuration(self):
-        self.write_configuration_cluster()
-        self.write_configuration_nprobe()
-
-    # Find number of network interfaces type 'adapter' using lshw
-    def find_num_interfaces_lshw(self, adapter):
-        n = Consts.CPROBE_INTERFACES_NONE
+        """Write nProbe configuration file"""
         try:
-            cmd = "{} | grep {}".format(Consts.LSHW_NET_BUSINFO, adapter)
-            sout = run_cmd_e(cmd)
-            sout = sout.strip()
-            if not sout:
-                return n
-            contents = sout.split('\n')
-            return len(contents)
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            with open(self.config_file, 'w') as fp:
+                if self.settings['interface']:
+                    fp.write(f"--interface={self.settings['interface']}\n")
+                fp.write(f"--netflow-engine=0:{self.instance_num}\n")
+                fp.write(f"--cpu-affinity={self.settings['cpu_affinity']}\n")
+                fp.write(f"--verbose={self.settings['debug_level']}\n")
+                
+                if self.settings['target'] != 'none':
+                    for target in self.settings['target'].split(','):
+                        fp.write(f"--collector={target.strip()}\n")
+                
+                fp.write(f"--flow-templ=\"{self.settings['template']}\"\n")
+                fp.write(f"--dump-stats={self.stats_file}\n")
+                fp.write(f"--aggregation={self.settings['aggregation']}\n")
+                fp.write(f"--sample-rate={self.settings['sample_rate']}\n")
+                fp.write(f"--flow-version={self.settings['flow_version']}\n")
+                fp.write(f"--lifetime-timeout={self.settings['lifetime_timeout']}\n")
+                fp.write(f"--idle-timeout={self.settings['idle_timeout']}\n")
+
+                # Add any custom advanced options
+                if 'advanced_options' in self.settings:
+                    for opt in self.settings['advanced_options']:
+                        fp.write(f"{opt}\n")
+
+            return True
         except Exception as e:
-            self.logger.error("Failed to find number of adapters\n{}".format(str(e)))
-        return n
+            self.logger.error(f"Failed to write configuration: {e}")
+            return False
 
-    # Detect compatible network adapters using 'lshw'
-    def _detect_compatible_adapter_lshw(self):
-        self._compatible_adapter_present = False
-        # Find number of network interfaces of type CPROBE_ADAPTER
-        num_iface = self.find_num_interfaces_lshw(Consts.CPROBE_ADAPTER)
-        self.logger.info("Number of interfaces found: {}".format(num_iface))
-        # If found 2 (2x40 mode) or 4 (4x10 mode) interfaces
-        if num_iface in [Consts.CPROBE_INTERFACES_2x40, Consts.CPROBE_INTERFACES_4x10]:
-            self._compatible_adapter_present = True
-
-    # Get current qsfp mode using intel 'lshw'
-    def _get_qsfp_mode_lshw(self):
-        num_iface = self.find_num_interfaces_lshw(Consts.CPROBE_ADAPTER)
-        self._qsfp_mode = Consts.QSFP_MODE_MAP.get(num_iface, Consts.QSFP_MODE_UNSUPPORTED)
-        self.logger.info("qsfp_mode: {}".format(self._qsfp_mode))
-        return self._qsfp_mode
-
-    # Detect compatible network adapters using intel 'qcu' utility
-    # Note: Using this tool in production is not recommended by intel
-    def _detect_compatible_adapter_qcu(self):
-        cmd = "{} /devices".format(Consts.QSFP_CONFIG_UTIL)
-        self._compatible_adapter_present = False
+    def start(self) -> bool:
+        """Start nProbe instance"""
         try:
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                raise Exception(sout)
-            contents = sout.split('\n')
-            for line in contents:
-                if "Adapter Name" in line:
-                    self._compatible_adapter_present = True
-                    break
-                elif "No supported adapters detected" in line:
-                    break
+            if not self.write_configuration():
+                return False
+
+            cmd = f"nprobe --config-file {self.config_file}"
+            self.process = subprocess.Popen(cmd.split())
+            self.logger.info(f"Started nProbe instance {self.instance_num}")
+            return True
         except Exception as e:
-            self.logger.error('Error querying compatible adapters: {}'.format(e))
-        if self._compatible_adapter_present:
-            self.logger.debug('A compatible adapter was detected')
-        else:
-            self.logger.debug('No compatible adapters were detected')
-        return self._compatible_adapter_present
+            self.logger.error(f"Failed to start nProbe: {e}")
+            return False
 
-    def detect_compatible_adapter(self):
-        if self._compatible_adapter_present is None:
-            self._detect_compatible_adapter_lshw()
-        return self._compatible_adapter_present
-
-    # Get current qsfp mode using intel 'qcu' utility
-    # Note: Using this tool in production is not recommended by intel
-    def _get_qsfp_mode_qcu(self):
-        NIC = 1
-        cmd = "{} /nic={} /info".format(Consts.QSFP_CONFIG_UTIL, NIC)
-        self._qsfp_mode = Consts.QSFP_MODE_UNSUPPORTED
-        try:
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                return self._qsfp_mode
-            contents = sout.split('\n')
-            for line in contents:
-                if "Current Configuration" in line:
-                    self._qsfp_mode = line.split(':')[1].strip()
-                    self.logger.debug('Current QSFP mode: {}'.format(self._qsfp_mode))
-        except Exception as e:
-            self.logger.error('Error querying qsfp_mode - {}'.format(str(e)))
-            traceback.print_stack(limit=6)
-
-        return self._qsfp_mode
-
-    def get_qsfp_mode(self):
-        if self._qsfp_mode is None:
-            self._get_qsfp_mode_lshw()
-        return self._qsfp_mode
-
-    # Note: Intel does not recommend using the qcu utility in production
-    # However, there is no way to avoid that. So, trying to minimize its usage.
-    def set_qsfp_mode(self, mode):
-        self._qsfp_mode = None
-        ret = False
-        msg = None
-        NIC = 1
-        cmd = "{} /nic={} /set {}".format(Consts.QSFP_CONFIG_UTIL, NIC, mode)
-        try:
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                if serr:
-                    errors = serr.split('\n')
-                    for line in errors:
-                        if "Error:" in line:
-                            return False, line
-                return False, "Unknown error"
-            # success
-            contents = sout.split('\n')
-            for line in contents:
-                self.logger.debug('{}'.format(line))
-                if any(x in line for x in ["Restart the system", "No change needed"]):
-                    # Do not write configuration now as the current running qsfp mode
-                    # does not match with the values in database. It gets applied only
-                    # on the next reboot.
-                    # self.write_configuration()
-                    ret = True
-                    msg = line
-                    break
-            if ret == False:
-                msg = "QSFP settings were not applied"
-        except Exception as e:
-            msg = "Error setting qsfp_mode {}".format(e)
-            self.logger.error(msg)
-            traceback.print_stack(limit=6)
-        return ret, msg
-
-    def get_service_names(self, all_services=False):
-        if all_services or self.detect_compatible_adapter():
-            if all_services:
-                num = Consts.CPROBE_MAX_QUEUES
-            else:
-                num = self.num_queues_sw if self.enable_balancer else self.num_queues_hw
-            snames = ["{}@{}".format(self._my_service_name, n) for n in range(0, num)]
-        else:
-            snames = ["{}@0".format(self._my_service_name)]
-        return snames
-
-    def start(self, all_services=False):
-        self.write_configuration()
-        if self.enable_balancer:
-            control_process("cluster@{}".format(Consts.CPROBE_CLUSTER_ID), 'start')
-            gevent.sleep(1.0)
-
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'start')
-
-    def stop(self, all_services=False):
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'stop')
-        if all_services:
-            control_process("cluster@{}".format(Consts.CPROBE_CLUSTER_ID), 'stop')
-
-    def restart(self, all_services=False):
-        self.write_configuration()
-        for sname in self.get_service_names(all_services):
-            control_process(sname, 'restart')
-
-    def get_current_queues(self):
-        queues = 0
-        try:
-            cmd = "ethtool -l {}".format(sorted(Consts.TRAFFIC_ADDRESSES)[0])
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                raise Exception(serr)
-            contents = sout.split('\n')
-            for line in contents:
-                if 'Combined' in line:
-                    queues = int(line.split(':')[1].strip())
-                    break
-        except Exception as e:
-            self.logger.error("Failed to retrieve queues from NIC: {}".format(e))
-        return queues
-
-    def configure_hugepages(self):
-        if self.enable_balancer:
-            run_cmd_e("sysctl -w vm.nr_hugepages={}".format(Consts.CPROBE_NUM_HUGEPAGES))
-
-    def configure_rss(self):
-        try:
-            if self.get_qsfp_mode() == Consts.QSFP_MODE_4x10:
-                rss_expected = self.num_queues_hw / Consts.QSFP_CHANNELS_4x10
-            else:
-                # If software balancer is enabled, use only one hardware queue
-                rss_expected = 1 if self.enable_balancer else self.num_queues_hw
-            rss_curr = self.get_current_queues()
-            self.logger.debug("RSS configuration - current:{} expected:{}".format(rss_curr, rss_expected))
-            if rss_curr == rss_expected:
-                self.logger.debug("Skipping RSS configuration")
-                return
-            # on Base2 pf_ringcfg fails towards end. This is expected. the rest of the commands would fix the issue with the failed pf_ringcfg . 
-            # on Base1 pf_ringcfg is successfull the rest of the commands would not harm because they simply restart the drivers. 
-            cmd = "pf_ringcfg --configure-driver {} --rss-queues {};systemctl stop pf_ring;systemctl restart capture_driver;systemctl start pf_ring".format(Consts.CPROBE_TRAFFIC_DRIVER, rss_expected)
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                raise Exception(serr)
-            self.logger.debug("pf_ringcfg log:\n{}".format(sout))
-            gevent.sleep(0.1)
-        except Exception as e:
-            self.logger.error("Failed to configure RSS {}".format(e))
-
-    def create_zc_license(self, zc_license, zc_license_id):
-        if not zc_license_id or not zc_license:
-            return
-        try:
-            zc_license_file = os.path.join(Consts.CPROBE_PFRING_CONF_DIR, zc_license_id)
-            with open(zc_license_file, 'w') as f:
-                f.write(zc_license)
-            self.logger.debug("Created new zc license {}".format(zc_license_file))
-        except Exception as e:
-            self.logger.error("Failed to create zc license {}".format(e))
-
-    # TODO: Use "pfcount -L -v 1" or "pfcount -I" to get zc license state after fixing:
-    #  https://github.com/ntop/nProbe/issues/576
-    def validate_zc_license(self, interface_num):
-        zc_license_date = invalid_license = 'Invalid license'
-        interface = sorted(Consts.TRAFFIC_ADDRESSES)[interface_num]
-        try:
-            cmd = "zcount -i zc:{}@0 -M".format(interface)
-            rc, serr, sout = run_cmd(cmd)
-            if rc != 0 or serr != '':
-                self.logger.error("Error in running zcount - {}".format(serr))
-            else:
-                contents = sout.strip('\n')
-                self.logger.debug("zcount log: {}".format(contents))
-                # zcount output may contain 'maintenance expired' or other errors
-                if 'maintenance expired' in contents:
-                    zc_license_date = 'Maintenance expired'
-                elif invalid_license in contents:
-                    pass
-                else:
-                    # 1615545023 Fri Mar 12 02:30:23 2021
-                    zc_license_date = contents.split(' ', 1)[1]
-        except (IndexError, AttributeError, TypeError) as e:
-            self.logger.error("Exception in validate_zc_license for {}: {}".format(interface, e))
-        except Exception as e:
-            self.logger.error("Failed to configure zc license for {}: {}".format(interface, e))
-        self.logger.debug('Interface:{} ZC License date: {}'.format(interface, zc_license_date))
-        return zc_license_date
-
-    def configure_zc_licenses(self):
-        if not self.zc_licenses or len(self.license) < 1:
-            self.logger.debug('No ZC licenses available')
-            return
-        # remove old licenses
-        skip_files = ['hugepages.conf', 'interfaces.conf', 'pf_ring.conf', 'pf_ring.start', 'zc']
-        removed = rm_files_in_dir(Consts.CPROBE_PFRING_CONF_DIR, skip_files)
-        for r in removed:
-            self.logger.debug("Removed old zc license {}".format(r))
-        # Create all new license files
-        for n, zc in enumerate(self.zc_licenses):
-            self.create_zc_license(zc.get("license"), zc.get("id"))
-        gevent.sleep(0.1)
-        # Validate license(s) for all interfaces
-        qsfp_mode = self.get_qsfp_mode()
-        if qsfp_mode == Consts.QSFP_MODE_4x10:
-            for n in range(len(self.zc_licenses)):
-                self.zc_licenses[n]['date'] = self.validate_zc_license(n)
-        else:
-            # Validate license only for one interface
-            self.zc_licenses[0]['date'] = self.validate_zc_license(0)
-        self.db.system_settings.update({}, {"$set": {'cprobe_zc_licenses': self.zc_licenses}})
-
-    def init_services(self):
-        try:
-            if self.detect_compatible_adapter():
-                # stop all services before configuration
-                self.configure_rss()
-                self.configure_hugepages()
-                # Bring up interfaces with new settings
-                self.ubCfg.restart_networking()
-                self.configure_zc_licenses()
-            self.start()
-        except Exception as e:
-            self.logger.error("Failed to initialize services: {}".format(e))
-
-    def get_nprobe_version(self):
-        """
-        Welcome to nProbe v.8.7.191029 (r6657) for x86_64-pc-linux-gnu
-
-        Build OS:      Ubuntu 18.04.3 LTS
-        SystemID:      8CDDB6269207AB27
-        GIT rev:       dev:a6e55269633e4bef2a25cb3e2788cb86d74c7fbe:20191029
-        License:       Invalid nProbe license (/etc/nprobe.license) [Missing license file]
-        :return:
-        """
-        self.db.system_settings.update({}, {"$set": {'cprobe_license_date': None}})
-        my_cmd = "nprobe -v"
-        p = subprocess.Popen(my_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        sout, serr = p.communicate()
-        rc = p.returncode
-        if rc != 0 or serr != '':
-            self.logger.debug("Error while running {}: RC={} stderr: {}".format(my_cmd, rc, serr))
-        contents = sout.split('\n')
-        for line in contents:
+    def stop(self) -> bool:
+        """Stop nProbe instance"""
+        if self.process:
             try:
-                if "Welcome to nProbe" in line:
-                    version = re.search(r'(.*) (v\.[0-9]{1,2}\.[0-9]\.[0-9]+) (.*)', line).group(2)
-                    self.logger.debug('the nProbe version is: {}'.format(version))
-                    self.db.system_settings.update({}, {"$set": {'cprobe_version': version}})
-                elif "SystemID" in line:
-                    sys_id = line.split()[1]
-                    self.logger.debug('the system ID is: {}'.format(sys_id))
-                    self.db.system_settings.update({}, {"$set": {'cprobe_system_id': sys_id}})
-                elif "Maintenance" in line or "Lic. Duration" in line:
-                    """
-                    examples are:
-                        'Maintenance:   Until Mon Nov 30 02:50:42 2020 [315 days left]'
-                        'Lic. Duration: Until Fri Jan  8 15:31:17 2021 [355 days left]'
-                        'Maintenance:   Expired'
-
-                    RegEx bug:
-                        The regex patterns such as '(.*)' sometimes do not work.
-                        Although (.*) makes sense in theory, it can't be used because
-                        the regex engine is trying to repeat something which can be null.
-                        https://bugs.python.org/issue18647
-                        Seems to have been fixed between versions 2.7.5 and 2.7.6
-                    """
-                    lic_date = None
-                    groups = re.search(r'\w+:(?: {1,3})?(Until|Expired)? ?([^[]+)?', line).groups()
-                    if groups:
-                        if len(groups) >= 2 and groups[0] == 'Until':
-                            lic_date = groups[1].strip()
-                        elif len(groups) >= 1 and groups[0] == 'Expired':
-                            lic_date = 'Maintenance expired'
-                    if lic_date:
-                        self.logger.debug('the License date is: {}'.format(lic_date))
-                        self.db.system_settings.update({}, {"$set": {'cprobe_license_date': lic_date}})
-                    else:
-                        self.logger.error('Invalid maintenance string:{} groups:{}'.format(line, str(groups)))
-                elif "Invalid license" in line:
-                    """
-                    New text format for v10.2.x license errors
-                    examples:
-                        'License:   Invalid license (/etc/nprobe.license) [Unable to unlock this version (maintenance expired)]'
-                        'License:   Invalid license (/etc/nprobe.license) [License mismatch error]'
-                    """
-                    license_message = re.findall(r'\[.+\]', line)
-                    if license_message and len(license_message) > 0:
-                        lic_date = license_message[0].lstrip('[').rstrip(']')
-                    else:
-                        lic_date = "Invalid license"
-                    self.logger.debug('the License date is: {}'.format(lic_date))
-                    self.db.system_settings.update({}, {"$set": {'cprobe_license_date': lic_date}})
-            except AttributeError as e:
-                self.logger.error('Error while parsing line {}\n{}'.format(line, str(e)))
+                self.process.terminate()
+                self.process.wait(timeout=10)
+                self.process = None
+                self.logger.info(f"Stopped nProbe instance {self.instance_num}")
+                return True
             except Exception as e:
-                self.logger.error('Exception while parsing line {}\n{}'.format(line, str(e)))
-                traceback.print_stack(limit=6)
-        return rc
+                self.logger.error(f"Failed to stop nProbe: {e}")
+                return False
+        return True
+
+    def restart(self) -> bool:
+        """Restart nProbe instance"""
+        self.stop()
+        return self.start()
+
+    def get_status(self) -> str:
+        """Get nProbe instance status"""
+        if not self.process:
+            return "stopped"
+        return "running" if self.process.poll() is None else "stopped"
