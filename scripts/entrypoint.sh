@@ -22,14 +22,14 @@ chown -R nprobe:nprobe /opt/nprobe /var/lib/nprobe
 
 # Initialize configuration from JSON if provided
 python3 -c "
-from cprobe_control import cProbeControl
+from cprobe_control import NProbeController
 from json import load
 from pathlib import Path
 
 try:
     config_file = Path('/opt/nprobe/config/nprobe-config.json')
     if config_file.exists():
-        controller = cProbeControl(None, None)  # DB and logger will be None in container
+        controller = NProbeController(None, None)  # DB and logger will be None in container
         controller.write_configuration()
         print('Configuration initialized')
 except Exception as e:
