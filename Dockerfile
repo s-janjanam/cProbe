@@ -50,6 +50,7 @@ RUN useradd -r -s /bin/false nprobe && \
 COPY cprobe_control.py /opt/nprobe/
 COPY helper_functions.py /opt/nprobe/
 COPY consts.py /opt/nprobe/
+COPY MyLogging.py /opt/nprobe/
 
 # Copy configuration files
 COPY config/nprobe-config.json /opt/nprobe/config/
