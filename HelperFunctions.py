@@ -58,6 +58,8 @@ def detect_virtual():
             my_logger.debug("Not running in a VM: ({})".format(serr))
             return None
         else:
+            if isinstance(sout, bytes):
+                sout = sout.decode('utf-8')
             sout = sout.rstrip("\n\r")
             my_logger.debug("Detected VM: \"{}\"".format(sout))
             return sout
@@ -307,7 +309,7 @@ def files_size(from_time, to_time, recording_id=None):
                         {"time": {"$gte": from_time}},
                         {"time": {"$lt": to_time}}
                     ]})
-            count += cursor.count()
+            count += cursor.collection.count_documents(cursor._Cursor__spec)
             for c in cursor:
                 total_size += c.get('size', 0)
                 if c.get('time') == to_time - 1:
@@ -418,12 +420,12 @@ def epoch_to_sec(epoch_time):
 
 def parse_start_end_times():
     resolution = "sec"
-    start_time = extract_parameter('startTime', ParameterType.float, min_val=0, max_val=sys.maxint).value
+    start_time = extract_parameter('startTime', ParameterType.float, min_val=0, max_val=sys.maxsize).value
     if start_time is not None:
         start_time, resolution = epoch_to_sec(start_time)
     else:
         start_time = time.time() - 5
-    end_time = extract_parameter('endTime', ParameterType.float, min_val=0, max_val=sys.maxint).value
+    end_time = extract_parameter('endTime', ParameterType.float, min_val=0, max_val=sys.maxsize).value
     if end_time is not None:
         end_time, resolution = epoch_to_sec(end_time)
     else:
@@ -512,7 +514,7 @@ def extract_parameter(field, param_type=ParameterType.safeString, allowGet=True,
             requestData = int(requestData)
         except ValueError:
             isNumber = False
-        max_val = sys.maxint if max_val is None else max_val
+        max_val = sys.maxsize if max_val is None else max_val
         isValid = isNumber and (max_val >= requestData >= min_val)
         if not isValid:
             return Parameter(None, 400,
@@ -523,7 +525,7 @@ def extract_parameter(field, param_type=ParameterType.safeString, allowGet=True,
             requestData = float(requestData)
         except ValueError:
             isNumber = False
-        max_val = sys.maxint if max_val is None else max_val
+        max_val = sys.maxsize if max_val is None else max_val
         isValid = isNumber and (max_val >= requestData >= min_val)
         if not isValid:
             return Parameter(None, 400,
@@ -550,7 +552,7 @@ def extract_parameter(field, param_type=ParameterType.safeString, allowGet=True,
             requestData = datetime.utcfromtimestamp(float(requestData))
         except ValueError:
             isDate = False
-        max_val = sys.maxint if max_val is None else max_val
+        max_val = sys.maxsize if max_val is None else max_val
         isValid = isDate and (max_val >= requestData >= min_val)
         if not isValid:
             now = datetime.now()
@@ -625,7 +627,7 @@ def cidr_to_netmask(cidr):
     if mask < 0 or mask > 32:
         return None
     bits = 0
-    for i in xrange(32-mask, 32):
+    for i in range(32-mask, 32):
         bits |= (1 << i)
     return socket.inet_ntoa(struct.pack('>I', bits))
 
@@ -822,6 +824,8 @@ def hostname_ip():
     hostname_cmd = "hostname -I"
     p = subprocess.Popen(hostname_cmd, stdout=gevent.subprocess.PIPE, shell=True)
     sout, serr = p.communicate()
+    if isinstance(sout, bytes):
+        sout = sout.decode('utf-8')  
     ips = sout.split()
     capture_ips = [x[0].split('/')[0] for x in Consts.TRAFFIC_ADDRESSES.values()]
     for ip in ips:
@@ -908,7 +912,7 @@ def delete_from_a_drive(in_path):
             my_logger.warn("Error while removing: {}".format(in_path))
             rv = {'status': 'error'}
         my_logger.debug("It took {} seconds to to delete: {} files from path: {}".
-                        format(time.time() - start_time, cursor.count(), in_path))
+                        format(time.time() - start_time, cursor.collection.count_documents(cursor._Cursor__spec), in_path))
     except TypeError:
         my_logger.error('delete_from_a_drive: failed to extract recording id from:{}'.format(in_path))
 
@@ -1139,8 +1143,8 @@ class myIpc(object):
             return
 
         try:
-            self.ipc.send(msg)
-            self.ipc.send('\n')
+            self.ipc.send(msg.encode())
+            self.ipc.send('\n'.encode())
         except socket.error as e:
             self.logger.debug("Socket error({0}): {1}".format(e.errno, e.strerror))
             # The pcapIPC isn't available (104: Connection reset by peer)
@@ -1153,7 +1157,7 @@ class myIpc(object):
 
                 self.ipc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.ipc.connect("/tmp/pcapIPC")
-                sent = self.ipc.send(msg+'\n')
+                sent = self.ipc.send(msg+'\n'.encode())
                 if sent == 0:
                     self.logger.debug("Unable to send. resetting&reconnecting.")
                     self._removePcapIpcSocket()
@@ -1185,7 +1189,7 @@ class myIpc(object):
                 # subscribeMessage = json.dumps(subScribeOpts, separators=(',', ':'))
                 # self.ipc.send(subscribeMessage+'\n')
 
-                file = self.ipc.makefile('r', 0)
+                file = self.ipc.makefile('r')
 
 
                 for l in file:
@@ -1250,7 +1254,7 @@ class myLs(object):
             # process already terminated - we'll get a a no such process error
             pass
 
-    def next(self):
+    def __next__(self):
         while True:
             h = self.p.stdout.readline()
             if h == '':
@@ -1459,7 +1463,7 @@ def init_db_and_logger(my_name):
         try:
             sys_settings = my_db().system_settings.find_one()
         except py_errors.ConnectionFailure as e:
-            print("Helper Functions failed to connect to mongodb: {}".format(e.message))
+            print("Helper Functions failed to connect to mongodb: {}".format(str(e)))
             sys_settings = None
 
     if sys_settings is not None:
