@@ -282,8 +282,8 @@ class Consts(object):
         'arista_timestamp_mode': ("none", str),
     }
 
-    DEFAULT_SETTINGS = {k: v[0] for k, v in DEFAULT_SETTINGS_WITH_TYPES.iteritems()}
-    DEFAULT_SETTINGS_TYPES = {k: v[1] for k, v in DEFAULT_SETTINGS_WITH_TYPES.iteritems()}
+    DEFAULT_SETTINGS = {k: v[0] for k, v in DEFAULT_SETTINGS_WITH_TYPES.items()}
+    DEFAULT_SETTINGS_TYPES = {k: v[1] for k, v in DEFAULT_SETTINGS_WITH_TYPES.items()}
 
     # These are settings that may be useful for debugging purposes only
     STATS_DB_DEFAULT_SETTINGS = {
