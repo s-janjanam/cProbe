@@ -62,7 +62,7 @@ class MyLogger:
         self.logger.info("TC info ##teamcity[message text='{}' status='NORMAL']".format(msg))
 
     def tc_warn(self, msg):
-        self.logger.warn("TC warning ##teamcity[message text='{}' status='WARNING']".format(msg))
+        self.logger.warning("TC warning ##teamcity[message text='{}' status='WARNING']".format(msg))
 
     def tc_error(self, msg):
         self.logger.error("TC error ##teamcity[message text='{}' status='WARNING']".format(msg))
@@ -96,7 +96,7 @@ class MyLogger:
         self.logger.info(msg)
 
     def warn(self, msg):
-        self.logger.warn(msg)
+        self.logger.warning(msg)
 
     # udp_alert('category: appdev  Warn - ' + msg)
 
@@ -121,34 +121,34 @@ def udp_alert(txt='TEST', dest_addr='127.0.0.1', port_indx=-1):
     """
     if port_indx < 2:
         # ensure that configuration is set only once
-        port_indx = udp_alert.alert_scoket_dest[1]  # 2nd element of the two tuple (see function attribute below)
+        port_indx = udp_alert.alert_socket_dest[1]  # 2nd element of the two tuple (see function attribute below)
 
         if port_indx < 2 or port_indx > 2 ** 16 - 1:  # destination port was not set from config file yet
             try:
                 # use explicit call to config parser (and not my module) to avoid circular
                 #  dependencies between modules MyLogging and MyAppconfig
-                import ConfigParser
+                import configparser
 
-                cfg = ConfigParser.SafeConfigParser()
+                cfg = configparser.ConfigParser()
                 cfg.read(INI_MYCONFIG)
                 port_indx = int(cfg.get('ports', 'udp_alerts'))
                 udp_alert.enable = cfg.get('DEFAULT', 'dev_udp_alerts')
-            except:
+            except Exception:
                 port_indx = -1
                 udp_alert.enable = None
                 # print 'udp_alert() setup failed - incorrect port (%s) from config or no config file: ' % str(port_indx)
 
     # destination for the udp alert
-    udp_alert.alert_scoket_dest = (dest_addr, port_indx)
+    udp_alert.alert_socket_dest = (dest_addr, port_indx)
 
     if port_indx > 1:
         if udp_alert.enable and udp_alert.enable.lower()[0] == 'y':  # if "yes" in config file
-            udp_alert.alert_scoket.sendto(txt, udp_alert.alert_scoket_dest)
+            udp_alert.alert_socket.sendto(txt.encode(), udp_alert.alert_socket_dest)
 
 
 # function attribute 
-udp_alert.alert_scoket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_alert.alert_scoket_dest = ('', -1)
+udp_alert.alert_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_alert.alert_socket_dest = ('', -1)
 udp_alert.enable = None
 
 if __name__ == '__main__':
@@ -157,6 +157,6 @@ if __name__ == '__main__':
     # 'application' code
     my_logger.debug('debug message')
     my_logger.info('info message')
-    my_logger.warn('warn message')
+    my_logger.warning('warn message')
     my_logger.error('error message')
     my_logger.critical('critical message')
