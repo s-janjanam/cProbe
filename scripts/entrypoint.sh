@@ -1,36 +1,41 @@
 #!/bin/bash
 set -e
 
-# Load environment variables if exists
-if [ -f "/opt/nprobe/config/nprobe.env" ]; then
-    source /opt/nprobe/config/nprobe.env
-fi
+echo "--- cProbe Container Entrypoint v2.0 ---"
 
-# Load required kernel modules if PF_RING is enabled
-if [[ "${NPROBE_USE_PFRING:-false}" == "true" ]] && [ -f "/etc/modules-load.d/pf_ring.conf" ]; then
-    modprobe pf_ring || echo "Warning: Could not load pf_ring"
-    modprobe pf_ring_zc || echo "Warning: Could not load pf_ring_zc"
-fi
+# 1. Ensure directories exist and have correct permissions
+# /var/run is needed for PID files
+mkdir -p /opt/nprobe/config /opt/nprobe/logs /var/run /var/lib/nprobe
+chown -R nprobe:nprobe /opt/nprobe /var/run /var/lib/nprobe
 
-# Create necessary directories and set permissions
-mkdir -p /opt/nprobe/config /opt/nprobe/logs /var/lib/nprobe
-chown -R nprobe:nprobe /opt/nprobe /var/lib/nprobe
+# 2. Perform one-time system tuning via the controller
+# This must be done as root before dropping privileges, but here we run as nprobe
+# So the container must be started with --privileged for these to work
+echo "Applying system tuning from config.json..."
+python3 -c "from cprobe_control import NProbeController; NProbeController().apply_system_tuning()"
 
-# Initialize configuration from JSON if provided
+# 3. Start the Flask API in the background. It will manage nprobe.
+echo "Starting the cProbe control API on port 5000..."
+# Using exec as the last command is good, but we need to background the API
+# and then perform the initial start.
+python3 /opt/nprobe/app.py &
+API_PID=$!
+# Give the API a moment to start up
+sleep 5 
+
+# 4. Trigger the initial startup of the nprobe pool
+# The controller will read the default num_threads from config.json
+echo "Triggering initial startup of the nprobe instance pool..."
 python3 -c "
 from cprobe_control import NProbeController
-from pathlib import Path
-
 try:
-    config_file = Path('/opt/nprobe/config/nprobe-config.json')
-    if config_file.exists():
-        # Only one argument: instance_num
-        controller = NProbeController(0)
-        controller.write_configuration()
-        print('Configuration initialized')
+    controller = NProbeController()
+    default_queues = controller.config.get('nprobe', {}).get('capture', {}).get('num_threads', 1)
+    controller.reconfigure_queues(default_queues)
 except Exception as e:
-    print(f'Error initializing configuration: {e}')
+    print(f'FATAL: Error during initial nprobe startup: {e}')
 "
 
-# Execute the main nprobe start script
-exec /opt/nprobe/scripts/start-nprobe.sh
+echo "--- Startup sequence complete. API is running. ---"
+# Wait for the API process to exit, which keeps the container alive
+wait $API_PID
