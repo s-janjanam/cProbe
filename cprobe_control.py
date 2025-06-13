@@ -1,146 +1,158 @@
-# cprobe_control.py
+# cprobe_control.py (Rewritten)
 import json
 import os
 import subprocess
 import logging
-from pathlib import Path
 import time
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-class NProbeConstants:
-    """Consolidated constants for nProbe configuration."""
-    BASE_CONFIG_PATH = "/opt/nprobe/config/nprobe-config.json"
-    CONFIG_FILE_FORMAT = "/opt/nprobe/config/nprobe-{}.conf"
-    STATS_FILE_FORMAT = "/opt/nprobe/logs/nprobe-{}.stats"
-    PID_FILE_FORMAT = "/var/run/nprobe-{}.pid"
-    DEFAULT_TEMPLATE = "%IPV4_SRC_ADDR %IPV4_DST_ADDR %IN_BYTES %OUT_BYTES %IN_PKTS %OUT_PKTS"
-    IDLE_TIMEOUT = 300
-    LIFETIME_TIMEOUT = 1800
-    FLOW_VERSION = 9
-    DEBUG_LEVEL = 1
-
 class NProbeController:
-    def __init__(self, instance_num: int = 0):
-        self.logger = logging.getLogger(f"NProbeController-{instance_num}")
-        self.instance_num = instance_num
-        self.config_file = NProbeConstants.CONFIG_FILE_FORMAT.format(instance_num)
-        self.stats_file = NProbeConstants.STATS_FILE_FORMAT.format(instance_num)
-        self.pid_file = NProbeConstants.PID_FILE_FORMAT.format(instance_num)
-        self._load_settings()
+    CONFIG_PATH = "/opt/nprobe/config/config.json"
+    PID_DIR = "/var/run"
 
-    def _load_settings(self):
-        """Load settings from JSON, applying defaults first."""
-        self.settings = {
-            'interface': 'zc:eth0',
-            'target': 'none',
-            'template': NProbeConstants.DEFAULT_TEMPLATE,
-            'sample_rate': '1:1:1',
-            'flow_version': NProbeConstants.FLOW_VERSION,
-            'lifetime_timeout': NProbeConstants.LIFETIME_TIMEOUT,
-            'idle_timeout': NProbeConstants.IDLE_TIMEOUT,
-            'debug_level': NProbeConstants.DEBUG_LEVEL,
-            'aggregation': '1/1/1/1/0/0/0',
-            'advanced_options': []
+    def __init__(self):
+        self.logger = logging.getLogger("NProbeController")
+        self.config = self._load_config()
+        self.active_instances = self.config.get('nprobe', {}).get('capture', {}).get('num_threads', 1)
+
+    def _load_config(self):
+        """Loads the entire config.json file."""
+        self.logger.info(f"Loading configuration from {self.CONFIG_PATH}")
+        try:
+            with open(self.CONFIG_PATH, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            self.logger.error("config.json not found!")
+            return {}
+        except json.JSONDecodeError:
+            self.logger.error("Error decoding config.json!")
+            return {}
+
+    def _save_config(self):
+        """Saves the current config back to the file."""
+        self.logger.info(f"Saving configuration to {self.CONFIG_PATH}")
+        try:
+            with open(self.CONFIG_PATH, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to save config: {e}")
+
+    def _run_command(self, cmd):
+        """Helper to run and log shell commands."""
+        self.logger.info(f"Executing: {cmd}")
+        try:
+            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            if result.stdout: self.logger.info(result.stdout)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Command failed: {cmd}\n{e.stderr}")
+            return False
+
+    def apply_system_tuning(self):
+        """Applies system-level tuning from config.json."""
+        self.logger.info("Applying system tuning...")
+        env_config = self.config.get('environment', {})
+        ofed_config = env_config.get('mellanox_ofed', {})
+        sys_config = env_config.get('system', {})
+
+        if ofed_config.get('configure_hugepages'):
+            count = ofed_config.get('hugepages_count', 1024)
+            self._run_command(f"echo {count} > /proc/sys/vm/nr_hugepages")
+
+        if sys_config.get('set_cpu_governor') == 'performance':
+            self._run_command("for file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo 'performance' > $file; done")
+
+    def stop_all_instances(self):
+        """Stops all running nprobe instances based on PID files."""
+        self.logger.info("Stopping all nprobe instances...")
+        for pid_file in Path(self.PID_DIR).glob("nprobe-*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                self.logger.info(f"Stopping process with PID {pid} from {pid_file.name}")
+                os.kill(pid, 15)  # SIGTERM
+            except (ValueError, OSError) as e:
+                self.logger.warning(f"Could not stop process from {pid_file.name}: {e}")
+            finally:
+                pid_file.unlink()
+        time.sleep(2)  # Grace period for processes to die
+
+    def start_all_instances(self):
+        """Starts nprobe instances based on current configuration."""
+        nprobe_config = self.config.get('nprobe', {})
+        if not nprobe_config:
+            self.logger.error("'nprobe' section missing in config.json. Cannot start.")
+            return
+
+        main_interface = nprobe_config.get('capture', {}).get('interface', 'eth0')
+        cpu_affinity_map = nprobe_config.get('performance', {}).get('cpu_affinity', {})
+
+        self.logger.info(f"Starting {self.active_instances} nprobe instances for interface {main_interface}...")
+
+        for i in range(self.active_instances):
+            instance_conf_path = f"/opt/nprobe/config/nprobe-{i}.conf"
+            instance_pid_path = f"{self.PID_DIR}/nprobe-{i}.pid"
+            
+            # Use ZC syntax for multi-queue
+            instance_interface = f"zc:{main_interface}@{i}"
+            # Pin to CPU core from map, or fall back to instance number
+            instance_cpu = cpu_affinity_map.get(str(i), i)
+            
+            with open(instance_conf_path, 'w') as f:
+                # Core instance settings
+                f.write(f"--interface={instance_interface}\n")
+                f.write(f"--pid-file={instance_pid_path}\n")
+                f.write(f"--cpu-affinity={instance_cpu}\n")
+
+                # Add other settings from config.json
+                # This is a simplified example; a real implementation would iterate the JSON
+                f.write(f"-v {nprobe_config.get('general', {}).get('verbose_level', 1)}\n")
+                collector = nprobe_config.get('flow_export', {})
+                f.write(f"-n {collector.get('collector_ip')}:{collector.get('collector_port')}\n")
+                if nprobe_config.get('templates', {}).get('use_custom_template', False):
+                    f.write(f"-T \"{nprobe_config.get('templates', {}).get('custom_template')}\"\n")
+                f.write(f"-t {nprobe_config.get('flow_export', {}).get('inactive_timeout', 15)}\n")
+                f.write(f"-d {nprobe_config.get('flow_export', {}).get('active_timeout', 300)}\n")
+
+            # Launch this instance using the helper script
+            self._run_command(f"/opt/nprobe/scripts/start-nprobe.sh --config-file {instance_conf_path}")
+
+    def reconfigure_queues(self, queue_count: int):
+        """The main logic: stop, set hardware queues, update config, and start."""
+        if queue_count not in [4, 8, 12]:
+             self.logger.error(f"Invalid queue count: {queue_count}. Must be 4, 8, or 12.")
+             return False
+
+        # 1. Stop all current instances
+        self.stop_all_instances()
+
+        # 2. Set the hardware queue count on the main interface
+        main_interface = self.config.get('nprobe', {}).get('capture', {}).get('interface')
+        if not main_interface:
+            self.logger.error("No capture interface defined in config.json!")
+            return False
+        
+        self.logger.info(f"Setting NIC {main_interface} to {queue_count} combined queues...")
+        if not self._run_command(f"ethtool -L {main_interface} combined {queue_count}"):
+             self.logger.error("Failed to set hardware queues via ethtool. Aborting.")
+             return False
+        
+        # 3. Update the configuration state and save it
+        self.active_instances = queue_count
+        self.config['nprobe']['capture']['num_threads'] = queue_count
+        self._save_config()
+
+        # 4. Start the new pool of instances
+        self.start_all_instances()
+        return True
+
+    def get_status(self):
+        """Returns the status of the nprobe instance pool."""
+        running_pids = list(Path(self.PID_DIR).glob("nprobe-*.pid"))
+        return {
+            "configured_instances": self.active_instances,
+            "running_instances": len(running_pids),
+            "status": "running" if len(running_pids) > 0 else "stopped",
+            "pids": [p.name for p in running_pids]
         }
-        try:
-            config_path = Path(NProbeConstants.BASE_CONFIG_PATH)
-            if config_path.exists():
-                with open(config_path) as f:
-                    self.settings.update(json.load(f))
-                self.logger.info(f"Loaded configuration from {config_path}")
-        except Exception as e:
-            self.logger.error(f"Could not load settings from {NProbeConstants.BASE_CONFIG_PATH}: {e}")
-
-    def _save_settings(self):
-        """Save current settings to the base JSON configuration."""
-        try:
-            config_path = Path(NProbeConstants.BASE_CONFIG_PATH)
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(config_path, 'w') as f:
-                json.dump(self.settings, f, indent=4)
-            self.logger.info(f"Saved configuration to {config_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to save settings: {e}")
-
-    def write_configuration(self) -> bool:
-        """Write the nprobe .conf file from current settings."""
-        self.logger.info(f"Writing configuration to {self.config_file}")
-        try:
-            Path(self.config_file).parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_file, 'w') as fp:
-                fp.write(f"--interface={self.settings['interface']}\n")
-                fp.write(f"--pid-file={self.pid_file}\n")
-                fp.write(f"--verbose={self.settings['debug_level']}\n")
-                fp.write(f"--dump-stats={self.stats_file}\n")
-                if self.settings['target'] != 'none':
-                    for target in self.settings['target'].split(','):
-                        fp.write(f"--collector={target.strip()}\n")
-                fp.write(f"--flow-templ=\"{self.settings['template']}\"\n")
-                fp.write(f"--aggregation={self.settings['aggregation']}\n")
-                fp.write(f"--sample-rate={self.settings['sample_rate']}\n")
-                fp.write(f"--flow-version={self.settings['flow_version']}\n")
-                fp.write(f"--lifetime-timeout={self.settings['lifetime_timeout']}\n")
-                fp.write(f"--idle-timeout={self.settings['idle_timeout']}\n")
-                for opt in self.settings.get('advanced_options', []):
-                    fp.write(f"{opt}\n")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to write configuration file: {e}")
-            return False
-
-    def _is_running(self) -> bool:
-        """Check if the nprobe process is running via its PID file."""
-        if not Path(self.pid_file).exists():
-            return False
-        try:
-            with open(self.pid_file, 'r') as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            return True
-        except (IOError, ValueError, OSError):
-            return False
-
-    def start(self) -> bool:
-        """Start nProbe using the start-nprobe.sh script."""
-        if self._is_running():
-            self.logger.warning(f"nProbe instance {self.instance_num} is already running.")
-            return True
-        if not self.write_configuration():
-            return False
-        try:
-            cmd = f"/opt/nprobe/scripts/start-nprobe.sh --config-file {self.config_file}"
-            subprocess.Popen(cmd.split())
-            self.logger.info(f"Start command issued for nProbe instance {self.instance_num}.")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to start nProbe: {e}")
-            return False
-
-    def stop(self) -> bool:
-        """Stop the nProbe instance by killing the process from the PID file."""
-        if not self._is_running():
-            self.logger.warning(f"nProbe instance {self.instance_num} is not running.")
-            return True
-        try:
-            with open(self.pid_file, 'r') as f:
-                pid = int(f.read().strip())
-            self.logger.info(f"Stopping nProbe instance {self.instance_num} with PID {pid}...")
-            os.kill(pid, 15)  # SIGTERM
-            Path(self.pid_file).unlink(missing_ok=True)
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to stop nProbe: {e}")
-            return False
-
-    def restart(self) -> bool:
-        """Restart the nProbe instance."""
-        self.logger.info(f"Restarting nProbe instance {self.instance_num}...")
-        if self._is_running():
-            self.stop()
-            time.sleep(2)
-        return self.start()
-
-    def get_status(self) -> str:
-        """Get nProbe instance status."""
-        return "running" if self._is_running() else "stopped"
