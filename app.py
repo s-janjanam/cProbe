@@ -1,14 +1,17 @@
 # app.py (Updated)
 from flask import Flask, request, jsonify
 from cprobe_control import NProbeController
+from stats_manager import StatsManager  # <-- IMPORT
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# Use a single controller that manages the entire pool
+# --- INITIALIZE CONTROLLER AND STATS MANAGER ---
 controller = NProbeController()
+stats_manager = StatsManager(controller) # Pass controller for context
+stats_manager.run_in_background()        # Start the background polling
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -40,6 +43,11 @@ def restart_pool():
          return jsonify({"message": f"nProbe pool restarted with {current_queues} instances."})
     else:
          return jsonify({"error": "Failed to restart nprobe pool"}), 500
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Returns the latest performance statistics from the cache."""
+    return jsonify(stats_manager.get_latest_stats())
 
 @app.route('/api/stop', methods=['POST'])
 def stop_pool():
