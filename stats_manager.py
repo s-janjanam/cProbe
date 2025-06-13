@@ -32,30 +32,42 @@ class StatsManager:
                 stats[key] = value
         return stats
 
+    # stats_manager.py -> _collect_pfring_stats (Updated)
+
     def _collect_pfring_stats(self):
-        """Collects and aggregates stats from /proc/net/pf_ring for all active ZC queues."""
-        total_stats = {'packets_received': 0, 'bytes_received': 0, 'packets_dropped': 0}
+        """
+        Collects stats from /proc/net/pf_ring for each active ZC queue.
+        Returns a dictionary of per-queue stats, e.g., {'0': {'packets': X, ...}, '1': ...}
+        """
+        per_queue_stats = {}
         try:
-            # PF_RING ZC creates stats files named after the process PID.
-            # We will glob for all files associated with nprobe instances.
             base_dir = Path("/proc/net/pf_ring")
+            # Find stats files based on running PIDs
             for pid_file in Path(self.controller.PID_DIR).glob("nprobe-*.pid"):
                 try:
                     pid = pid_file.read_text().strip()
-                    # The stats file is typically named <pid>-<interface_name>.stats
-                    # We glob as the exact name can vary slightly.
                     for stats_file in base_dir.glob(f"{pid}-*.stats"):
+                        # Extract queue ID from filename like '12345-zc:eth0@1.stats'
+                        match = re.search(r'@(\d+)', stats_file.name)
+                        if not match:
+                            continue
+                        
+                        queue_id = match.group(1)
                         content = stats_file.read_text()
                         parsed = self._parse_proc_file(content)
-                        total_stats['packets_received'] += parsed.get('Tot Pkts', 0)
-                        total_stats['bytes_received'] += parsed.get('Tot Bytes', 0)
-                        total_stats['packets_dropped'] += parsed.get('Dropped', 0)
-                        break # Found stats for this PID, move to next
+                        
+                        per_queue_stats[queue_id] = {
+                            'packets_received': parsed.get('Tot Pkts', 0),
+                            'bytes_received': parsed.get('Tot Bytes', 0),
+                            'packets_dropped': parsed.get('Dropped', 0)
+                        }
+                        # Found stats for this PID, move to the next PID file
+                        break 
                 except Exception:
-                    continue # PID file might be stale, or stats file not ready
+                    continue
         except Exception as e:
             self.logger.warning(f"Could not read PF_RING stats: {e}")
-        return total_stats
+        return per_queue_stats
 
     def _collect_nprobe_stats(self):
         """Collects and aggregates stats from all nprobe instance stat files."""
@@ -75,13 +87,35 @@ class StatsManager:
             self.logger.warning(f"Could not read nprobe stats files: {e}")
         return total_stats
 
+    # stats_manager.py -> _calculate_rates_and_update (Updated)
+
     def _calculate_rates_and_update(self, current_pfring, current_nprobe, delta_t):
         """Calculates rates and updates the master stats dictionary."""
-        # --- PF_RING Rates ---
-        pps = (current_pfring['packets_received'] - self._previous_pfring.get('packets_received', 0)) / delta_t
-        bps = ((current_pfring['bytes_received'] - self._previous_pfring.get('bytes_received', 0)) * 8) / delta_t
-        gbps = bps / 1_000_000_000
         
+        # --- Aggregate PF_RING totals for overall rates ---
+        total_current_pkts = sum(q['packets_received'] for q in current_pfring.values())
+        total_current_bytes = sum(q['bytes_received'] for q in current_pfring.values())
+        total_previous_pkts = sum(q.get('packets_received', 0) for q in self._previous_pfring.values())
+        total_previous_bytes = sum(q.get('bytes_received', 0) for q in self._previous_pfring.values())
+        
+        pps = (total_current_pkts - total_previous_pkts) / delta_t
+        gbps = ((total_current_bytes - total_previous_bytes) * 8) / (delta_t * 1_000_000_000)
+        total_dropped = sum(q['packets_dropped'] for q in current_pfring.values())
+
+        # --- Calculate RX Queue Distribution ---
+        rx_queue_distribution = {}
+        delta_total_pkts = total_current_pkts - total_previous_pkts
+        
+        if delta_total_pkts > 0:
+            for q_id, q_stats in current_pfring.items():
+                prev_q_pkts = self._previous_pfring.get(q_id, {}).get('packets_received', 0)
+                delta_q_pkts = q_stats['packets_received'] - prev_q_pkts
+                percentage = (delta_q_pkts / delta_total_pkts) * 100
+                rx_queue_distribution[q_id] = {
+                    "usage_percent": round(percentage, 2),
+                    "dropped_packets": q_stats['packets_dropped'] # Per-queue drop count
+                }
+
         # --- nProbe Rates ---
         fps = (current_nprobe['flows_processed'] - self._previous_nprobe.get('flows_processed', 0)) / delta_t
 
@@ -95,16 +129,17 @@ class StatsManager:
                 "pf_ring_stats": {
                     "packets_per_second": round(pps, 2),
                     "gbps_rate": round(gbps, 4),
-                    "total_dropped_packets": current_pfring['packets_dropped'] # This is a key "processing drop" metric
+                    "total_dropped_packets": total_dropped
                 },
+                "rx_queue_distribution": rx_queue_distribution, # <-- NEWLY ADDED
                 "nprobe_stats": {
                     "flows_per_second": round(fps, 2),
                     "active_flows": current_nprobe['active_flows'],
                     "flow_cache_utilization_percent": round(flow_cache_utilization, 2),
-                    "total_export_drops": current_nprobe['export_drops'] # "sending side" drops
+                    "total_export_drops": current_nprobe['export_drops']
                 },
                 "cumulative_totals": {
-                    "total_packets_received": current_pfring['packets_received'],
+                    "total_packets_received": total_current_pkts,
                     "total_flows_processed": current_nprobe['flows_processed'],
                 }
             }
