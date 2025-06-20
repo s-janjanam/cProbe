@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  nprobe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nprobe-probe
+    privileged: true
+    network_mode: "host" # Use host networking for PF_RING ZC access to NICs
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - IPC_LOCK
+    volumes:
+      # Mount config and logs for persistence and easy access
+      - ./config:/opt/nprobe/config:rw
+      - ./logs:/opt/nprobe/logs:rw
+      
+      # Mount UI files for easy development (optional - they're also copied into the image)
+      - ./ui.html:/opt/nprobe/static/ui.html:ro
+      
+      # Mount host modules/kernel sources for DKMS
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      
+      # Mount dev for device access
+      - /dev:/dev
+    
+    # The API and UI are exposed via host networking
+    ports:
+      - "5001:5001"
+    
+    restart: unless-stopped
+    stop_grace_period: 30s
