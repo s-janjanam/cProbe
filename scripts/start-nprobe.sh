@@ -38,4 +38,3 @@ echo "$NPROBE_PID" > "$PID_FILE"
 
 echo "==> nProbe started with PID: $NPROBE_PID."
 echo "==> PID file created at: $PID_FILE."
-
