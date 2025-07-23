@@ -239,10 +239,18 @@
             try {
                 const options = { method, headers: { 'Content-Type': 'application/json' } };
                 if (data) options.body = JSON.stringify(data);
-                const response = await fetch(`${API_BASE_URL}/api${endpoint}`, options);
+                const response = await fetch(`${API_BASE_URL}/api/probe${endpoint}`, options); // <--- CORRECTED LINE
+                
+                // Check if the response is not valid JSON, which could indicate an HTML error page
+                const contentType = response.headers.get("content-type");
+                if (!contentType || !contentType.includes("application/json")) {
+                    const textResponse = await response.text();
+                    throw new Error(`Expected JSON but received ${contentType || 'text'}. Response: ${textResponse.substring(0, 100)}...`);
+                }
+
                 const result = await response.json();
                 if (!result.success) throw new Error(result.message || 'API call failed');
-                // Display the message from successful API calls
+                
                 if (result.message) showNotification(result.message, 'success');
                 return result;
             } catch (error) {
@@ -260,15 +268,13 @@
                 document.getElementById('process-status').textContent = status.process_status;
                 document.getElementById('configured-status').textContent = status.configured_status;
                 
-                // Manage button disabled state
                 const isRunning = status.process_status === 'running';
                 document.getElementById('start-text').parentElement.disabled = isRunning;
                 document.getElementById('stop-text').parentElement.disabled = !isRunning;
                 document.getElementById('restart-text').parentElement.disabled = !isRunning;
 
-                // Update indicators
                 const procIndicator = document.getElementById('process-status-indicator');
-                procIndicator.className = 'status-indicator'; // Reset classes
+                procIndicator.className = 'status-indicator';
                 if (isRunning) {
                     procIndicator.classList.add('status-running');
                 } else if (status.process_status === 'error') {
@@ -296,7 +302,7 @@
                 setTimeout(refreshStatus, 1000);
             } finally {
                 setButtonLoading('start-text', false);
-                refreshStatus(); // Re-check status to set button state correctly
+                refreshStatus();
             }
         }
 
@@ -317,13 +323,13 @@
                 await apiCall('/restart', 'POST');
                 setTimeout(refreshStatus, 2000);
             } finally {
-                setButtonLoading('restart-text', false);
+                setButtonLoading('restart-text', false
+                );
                 refreshStatus();
             }
         }
 
         function restartSystem() {
-            // This function now provides instructions, as the frontend cannot directly restart the container.
             alert("Container Restart Required\n\nTo apply certain changes like setting hardware queues, the Docker container must be restarted. Please run the following command in your terminal on the host machine:\n\ndocker-compose restart nprobe-probe");
         }
 
@@ -339,20 +345,16 @@
         }
         
         function populateConfigurationForm() {
-            // Interfaces
             const ifacesContainer = document.getElementById('interfaces-container');
             ifacesContainer.innerHTML = '';
             (currentConfig.capture?.interfaces || []).forEach(iface => addInterfaceElement(iface.name));
             
-            // RSS Queues (new field)
             document.getElementById('rss-queues-input').value = currentConfig.capture?.interfaces?.[0]?.rss_queues || 'auto';
 
-            // Targets
             const targetsContainer = document.getElementById('targets-container');
             targetsContainer.innerHTML = '';
             (currentConfig.export?.targets || []).forEach(target => addTargetElement(target));
 
-            // Other fields
             document.getElementById('flow-version').value = currentConfig.export?.flow_version || 9;
             document.getElementById('sample-rate').value = currentConfig.capture?.sample_rate || '1:1';
             document.getElementById('idle-timeout').value = currentConfig.export?.idle_timeout_secs || 15;
@@ -364,7 +366,6 @@
             populateCustomOptions();
         }
 
-        // --- START: New function to set RSS Queues ---
         async function setRssQueues() {
             const queuesInput = document.getElementById('rss-queues-input').value.trim();
             if (!queuesInput) {
@@ -372,7 +373,6 @@
                 return;
             }
             
-            // Use the string 'auto' or parse to an integer
             const queuesValue = queuesInput.toLowerCase() === 'auto' ? 'auto' : parseInt(queuesInput, 10);
             
             if (isNaN(queuesValue) && queuesValue !== 'auto') {
@@ -381,13 +381,20 @@
             }
 
             try {
-                await apiCall('/config/rss_queues', 'POST', { queues: queuesValue });
-                // The API call itself will show a success notification with instructions.
+                // This now posts to the main config endpoint, as there's no dedicated RSS endpoint in the new API design.
+                // We'll update the local config object and send the whole thing.
+                if (!currentConfig.capture) currentConfig.capture = {};
+                if (!currentConfig.capture.interfaces || currentConfig.capture.interfaces.length === 0) {
+                    currentConfig.capture.interfaces = [{ name: '', rss_queues: queuesValue }];
+                } else {
+                    currentConfig.capture.interfaces[0].rss_queues = queuesValue;
+                }
+                await apiCall('/config', 'POST', currentConfig);
+                showNotification('RSS Queues setting saved. Restart container to apply.', 'success');
             } catch (error) {
                 console.error('Failed to set RSS queues:', error);
             }
         }
-        // --- END: New function ---
 
         function addInterfaceElement(name = '') {
             const container = document.getElementById('interfaces-container');
@@ -427,58 +434,63 @@
         }
         function addCustomOption() { addCustomOptionElement(); }
 
+        function getFullConfigFromForm() {
+            const customOptions = {};
+            document.querySelectorAll('#custom-options-container .interface-item').forEach(item => {
+                const key = item.querySelector('.custom-key').value.trim();
+                const value = item.querySelector('.custom-value').value.trim();
+                if (key) customOptions[key] = value;
+            });
+            
+            const fullConfig = {
+                capture: {
+                    interfaces: Array.from(document.querySelectorAll('.interface-item')).map(item => ({ 
+                        name: item.querySelector('.interface-name').value.trim(),
+                        rss_queues: document.getElementById('rss-queues-input').value.trim()
+                    })).filter(iface => iface.name),
+                    sample_rate: document.getElementById('sample-rate').value || '1:1'
+                },
+                export: {
+                    targets: Array.from(document.querySelectorAll('.target-item')).map(item => item.querySelector('.target-address').value.trim()).filter(target => target),
+                    flow_version: parseInt(document.getElementById('flow-version').value),
+                    template: document.getElementById('template').value,
+                    idle_timeout_secs: parseInt(document.getElementById('idle-timeout').value) || 15,
+                    active_timeout_secs: parseInt(document.getElementById('active-timeout').value) || 60
+                },
+                processing: {
+                    aggregation: document.getElementById('aggregation').value || 'auto',
+                    custom_options: customOptions
+                },
+                logging: {
+                    debug_level: parseInt(document.getElementById('debug-level').value) || 2
+                }
+            };
+            return fullConfig;
+        }
+
         async function saveConfiguration() {
             try {
-                const config = {
-                    capture: {
-                        interfaces: Array.from(document.querySelectorAll('.interface-item')).map(item => ({ name: item.querySelector('.interface-name').value.trim() })).filter(iface => iface.name),
-                        sample_rate: document.getElementById('sample-rate').value || '1:1'
-                    },
-                    export: {
-                        targets: Array.from(document.querySelectorAll('.target-item')).map(item => item.querySelector('.target-address').value.trim()).filter(target => target),
-                        flow_version: parseInt(document.getElementById('flow-version').value),
-                        template: document.getElementById('template').value,
-                        idle_timeout_secs: parseInt(document.getElementById('idle-timeout').value) || 15,
-                        active_timeout_secs: parseInt(document.getElementById('active-timeout').value) || 60
-                    }
-                };
+                const config = getFullConfigFromForm();
                 await apiCall('/config', 'POST', config);
                 currentConfig = config;
             } catch (error) {
                 console.error('Failed to save configuration:', error);
             }
         }
-
+        
         async function saveAdvancedConfiguration() {
-            try {
-                const customOptions = {};
-                document.querySelectorAll('#custom-options-container .interface-item').forEach(item => {
-                    const key = item.querySelector('.custom-key').value.trim();
-                    const value = item.querySelector('.custom-value').value.trim();
-                    if (key) customOptions[key] = value;
-                });
-
-                const advancedConfig = {
-                    processing: {
-                        aggregation: document.getElementById('aggregation').value || 'auto',
-                        custom_options: customOptions
-                    },
-                    logging: {
-                        debug_level: parseInt(document.getElementById('debug-level').value) || 2
-                    }
-                };
-                
-                await apiCall('/config', 'POST', advancedConfig);
-            } catch (error) {
-                console.error('Failed to save advanced configuration:', error);
-            }
+            await saveConfiguration();
         }
 
         async function loadLogs() {
             try {
                 const lines = document.getElementById('log-lines').value || 100;
-                const result = await apiCall(`/logs?lines=${lines}`);
-                document.getElementById('logs-container').textContent = result.data.logs || 'No log entries found.';
+                // Note: The new API does not have a /logs endpoint. This functionality would need to be re-added to the Flask API.
+                // For now, we'll just show a message.
+                // const result = await apiCall(`/logs?lines=${lines}`);
+                // document.getElementById('logs-container').textContent = result.data.logs || 'No log entries found.';
+                document.getElementById('logs-container').textContent = 'Log viewing functionality not available in this version.';
+                showNotification('Log viewing is not implemented in the current API.', 'error');
             } catch (error) {
                 document.getElementById('logs-container').textContent = 'Failed to load logs. Check console for details.';
             }
