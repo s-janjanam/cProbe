@@ -1,0 +1,207 @@
+openapi: 3.0.3
+info:
+  title: "nProbe Control API"
+  description: "An API to control and configure an nProbe instance running in a Docker container."
+  version: "1.0.0"
+servers:
+  - url: "http://localhost:5001"
+    description: "Local server"
+
+paths:
+  /api/probe/status:
+    get:
+      summary: "Get nProbe Process Status"
+      description: "Checks the status of the nProbe process by checking the PID file and process list."
+      operationId: getStatus
+      tags:
+        - Probe Control
+      responses:
+        '200':
+          description: "Successful response with status data."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      configured_status:
+                        type: string
+                        example: "running"
+                      process_status:
+                        type: string
+                        example: "running"
+
+  /api/probe/start:
+    post:
+      summary: "Start nProbe"
+      description: "Issues the command to start the nProbe process using the current configuration."
+      operationId: startNprobe
+      tags:
+        - Probe Control
+      responses:
+        '200':
+          description: "nProbe start command issued successfully."
+        '500':
+          description: "Failed to start nProbe."
+
+  /api/probe/stop:
+    post:
+      summary: "Stop nProbe"
+      description: "Issues the command to stop the nProbe process."
+      operationId: stopNprobe
+      tags:
+        - Probe Control
+      responses:
+        '200':
+          description: "nProbe stop command issued successfully."
+        '500':
+          description: "Failed to stop nProbe."
+
+  /api/probe/restart:
+    post:
+      summary: "Restart nProbe"
+      description: "Issues commands to stop and then start the nProbe process."
+      operationId: restartNprobe
+      tags:
+        - Probe Control
+      responses:
+        '200':
+          description: "nProbe restart command issued successfully."
+        '500':
+          description: "Failed to restart nProbe."
+
+  /api/probe/config:
+    get:
+      summary: "Get Current Configuration"
+      description: "Retrieves the complete nProbe configuration from the JSON file."
+      operationId: getConfig
+      tags:
+        - Probe Configuration
+      responses:
+        '200':
+          description: "Successful response with configuration data."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/NprobeConfig'
+    post:
+      summary: "Set Full Configuration"
+      description: "Overwrites the entire nProbe configuration with the provided data. A container restart is required for hardware-level changes (like RSS) to apply."
+      operationId: setConfig
+      tags:
+        - Probe Configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NprobeConfig'
+      responses:
+        '200':
+          description: "Configuration updated successfully."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/NprobeConfig'
+        '400':
+          description: "Bad request, invalid data."
+        '500':
+          description: "Error updating configuration."
+
+components:
+  schemas:
+    NprobeConfig:
+      type: object
+      properties:
+        system_info:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: ["locked", "running", "stopped", "error"]
+            instance_id:
+              type: integer
+        capture:
+          type: object
+          properties:
+            interfaces:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    description: "Name of the network interface (e.g., enp104s0f0np0)."
+            sample_rate:
+              type: string
+              example: "1:1:1"
+        clustering:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              description: "Master switch to enable or disable PF_RING clustering."
+            cluster_id:
+              type: integer
+              description: "The ID for the PF_RING cluster (e.g., 99)."
+            rss_queues:
+              type: integer
+              description: "Number of hardware RSS queues to configure on the NIC."
+              enum: [4, 8, 12, 16]
+            capture_threads:
+              type: integer
+              description: "Number of nProbe software threads for packet capture."
+        processing:
+          type: object
+          properties:
+            aggregation:
+              type: string
+              example: "1.1/1/1/1/0/0/0"
+            custom_options:
+              type: object
+              additionalProperties: true
+        export:
+          type: object
+          properties:
+            targets:
+              type: array
+              items:
+                type: string
+                example: "10.51.10.238:2055"
+            flow_version:
+              type: integer
+              example: 9
+            template:
+              type: string
+            idle_timeout_secs:
+              type: integer
+              example: 15
+            active_timeout_secs:
+              type: integer
+              example: 60
+            export_policy:
+              type: string
+              example: "0"
+        logging:
+          type: object
+          properties:
+            debug_level:
+              type: integer
+              example: 2
