@@ -1,11 +1,11 @@
-FROM ubuntu:22.04
-# Avoid interactive prompts 
+FROM ubuntu:22.04 AS eager
+# Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Set working directory 
+# Set working directory
 WORKDIR /opt/nprobe
 
-# Install dependencies 
+# Install dependencies
 RUN apt-get update && \
     apt-get install -y \
     software-properties-common \
@@ -23,7 +23,7 @@ RUN apt-get update && \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Add ntop repository and install nProbe + PF_RING 
+# Add ntop repository and install nProbe + PF_RING
 RUN wget https://packages.ntop.org/apt-stable/22.04/all/apt-ntop-stable.deb && \
     apt install -y ./apt-ntop-stable.deb && \
     rm apt-ntop-stable.deb && \
@@ -32,32 +32,38 @@ RUN wget https://packages.ntop.org/apt-stable/22.04/all/apt-ntop-stable.deb && \
     nprobe \
     && rm -rf /var/lib/apt/lists/*
 
-# Create directories and user 
+# Create directories and user
 RUN mkdir -p /opt/nprobe/config /opt/nprobe/logs /opt/nprobe/scripts /opt/nprobe/static /var/lib/nprobe /etc/pf_ring/zc
 RUN groupadd --force --system nprobe && \
     chown -R nprobe:nprobe /opt/nprobe /var/lib/nprobe /etc/pf_ring/zc
 
-# Copy Python application files 
-COPY api.py cprobe_control.py /opt/nprobe/
+# --- MODIFIED SECTION ---
+# Copy Python application files using the new structure
+COPY run.py /opt/nprobe/
+COPY api/ /opt/nprobe/api/
+# --- END OF MODIFICATION ---
 
 # Copy static files (UI)
 COPY ui.html /opt/nprobe/static/
 
-# Copy configuration and scripts 
+# Copy openapi.yaml file for API
+COPY openapi.yaml /opt/nprobe/api/openapi.yaml
+
+# Copy configuration and scripts
 COPY scripts/entrypoint.sh /opt/nprobe/scripts/
 COPY scripts/start-nprobe.sh /opt/nprobe/scripts/
 RUN chmod +x /opt/nprobe/scripts/entrypoint.sh /opt/nprobe/scripts/start-nprobe.sh
 
-# Install Python requirements 
+# Install Python requirements
 RUN pip3 install --no-cache-dir flask gunicorn
 
-# Set environment variables 
+# Set environment variables
 ENV PATH="/opt/nprobe/scripts:${PATH}"
 ENV PYTHONPATH="/opt/nprobe:${PYTHONPATH}"
 
-# Expose ports for the API and potential flow collection 
-EXPOSE 5001/tcp 
+# Expose ports for the API and potential flow collection
+EXPOSE 5001/tcp
 EXPOSE 2055/udp 9995/udp
 
-# Set entrypoint 
+# Set entrypoint
 ENTRYPOINT ["/opt/nprobe/scripts/entrypoint.sh"]
